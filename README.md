@@ -33,15 +33,19 @@ npm run tauri dev
 
 ## 发布
 
-Gitea 和 GitHub 是互相独立的代码仓库，不会自动同步代码或 tag。Gitea 只用于存放代码和 tag，不执行构建；GitHub 也单独存放代码。需要发布时，分别在两个仓库维护对应的代码和 tag：Gitea 上的 tag 不会触发构建；将 `v*` tag 推送到 GitHub 后，GitHub Actions 才会构建 Windows x64 安装包（MSI/NSIS）、Linux x64 安装包（AppImage/DEB/RPM）和 macOS DMG，并创建 GitHub Release。请确保 GitHub tag 指向的提交包含要发布的代码。构建版本以 tag 为准。
+GitHub 是唯一代码仓库。日常开发在 `dev` 分支进行，通过 PR 合入受保护的 `main`。每个指向 `main` 的 PR 都会构建 macOS、Windows x64 和 Linux x64 安装包用于验证，不会创建 Release。合并 PR 后，单独推送 `v*` tag 才会构建并创建 GitHub Release；产物包括 macOS DMG、Windows MSI/NSIS，以及 Linux AppImage/DEB/RPM。
 
-提交好要发布的代码并确认本地 `main` 与两个远端没有分叉后，可一条命令更新项目版本、创建版本提交、推送 `main` 和同一个 tag：
+首个版本基准为 `0.1.0`。PR 中无需手动更新版本文件：正式构建时会从 tag 设置应用版本。
+
+PR 合并后，在本地更新 `main` 并运行发布命令。第一次不带参数会创建 `v0.1.0`；之后默认自动升 patch（如 `v0.1.0` → `v0.1.1`）：
 
 ```shell
-npm run release -- 0.1.1
+git switch main
+git pull --ff-only origin main
+npm run release
 ```
 
-命令要求工作区干净，并且本地配置 `origin`（Gitea）和 `github` 两个 remote。它会更新各平台版本号、运行前端构建、提交版本变更，推送 `main` 到两边，再推同一个 tag 到 Gitea 和 GitHub；最后一步会触发构建。Gitea 仓库的 Actions 必须关闭，避免 Gitea 也运行构建。若 tag 推送中断且远端分支仍与本地兼容，修复原因后可用相同版本号重新运行命令继续。
+需要发布 minor 或 major 版本时，可运行 `npm run release -- minor` 或 `npm run release -- major`。发布命令只检查 `main` 与 GitHub `origin/main` 完全一致、工作区干净且 tag 尚不存在，然后创建并推送 tag；它不会修改或推送 `main`。推送 tag 后会触发三平台正式构建和 GitHub Release。确保 GitHub 仓库的 `main` 分支保护规则要求 PR，并将 PR 工作流的三个构建检查设为必需状态检查。
 
 ## 安装
 
