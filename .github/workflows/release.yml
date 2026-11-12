@@ -157,7 +157,7 @@ jobs:
           path: artifacts/macos
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           draft: false
@@ -165,9 +165,6 @@ jobs:
           body_path: artifacts/macos/release-notes.md
           files: |
             artifacts/macos/*.dmg
-            artifacts/windows-x64/*.msi
-            artifacts/windows-x64/*.exe
-            artifacts/linux-x64/*.AppImage
-            artifacts/linux-x64/*.deb
-            artifacts/linux-x64/*.rpm
+            artifacts/windows-x64/**/*
+            artifacts/linux-x64/**/*
           fail_on_unmatched_files: true
