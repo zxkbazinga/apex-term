@@ -83,6 +83,15 @@ fn local_shell_command() -> CommandBuilder {
     command
 }
 
+#[cfg(target_os = "windows")]
+fn local_shell_command() -> CommandBuilder {
+    let mut command =
+        CommandBuilder::new(env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command
+}
+
 fn emit_utf8_chunk(app: &AppHandle, event_name: &str, pending: &mut Vec<u8>, chunk: &[u8]) {
     pending.extend_from_slice(chunk);
     match std::str::from_utf8(pending) {
