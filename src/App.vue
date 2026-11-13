@@ -1260,7 +1260,7 @@ onUnmounted(() => {
 
     <div class="app-body">
       <section class="main-panel">
-        <div v-if="(isMacOS || isWindowsOS) && runtimeAvailable" class="session-strip" :class="{ 'app-titlebar': isMacOS }">
+        <div v-if="(isMacOS || isWindowsOS) && runtimeAvailable" class="session-strip" :class="{ 'app-titlebar': isMacOS || isWindowsOS }">
           <div v-for="session in sessions" :key="session.id" class="session-tab" :class="{ 'session-tab-active': activeSessionId === session.id }" @click="activeSessionId = session.id">
             <span class="tab-live-dot" :class="sessionStates[session.id] || 'disconnected'"></span>
             <TerminalSquare :size="15" />
