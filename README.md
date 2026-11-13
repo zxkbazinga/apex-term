@@ -8,14 +8,15 @@
 - SSH 密码认证及交互式 xterm.js 终端
 - 启动时默认打开本机系统 Shell（macOS）
 - 首次连接确认服务器指纹，已信任主机指纹变化时拒绝连接
-- 系统原生菜单：外观、会话管理、SFTP 和关于；外观菜单可打开主题与字体设置
+- 应用菜单（macOS、Windows 下拉菜单；Linux 系统菜单）：外观、会话管理、SFTP 和关于；外观菜单可打开主题与字体设置
 - 多终端页签：本机 Shell 默认启动，添加 SSH 主机会新建页签，不会替换现有终端；可在会话列表切换本机终端
 - 终端支持 Ctrl/Command+C 复制选中文本、Ctrl/Command+V 粘贴；未选中文本时 Ctrl+C 仍发送中断信号
 - 使用 Command+R（macOS）或 Ctrl+R（Linux）重新连接/启动当前会话
 - SSH 主机连接测试，首次连接前核对服务器指纹
 - 系统原生 SFTP 菜单：连接 SSH 主机后可从系统菜单打开文件管理
 - SFTP 远程文件浏览、上传、下载、新建目录和删除
-- 多种终端主题（Homebrew、Dracula、Nord、Solarized Dark、Monokai、午夜、浅色），可设置字体和字号
+- 多种终端主题（Homebrew、macOS 玻璃、Dracula、Nord、Solarized Dark、Monokai、午夜、浅色），可设置字体和字号
+- 应用启动时自动检查 GitHub 最新正式版，有更新时在应用内提示；关于窗口也可手动检查并打开 Release 下载页
 - 默认黑色界面，桌面应用启动后全屏进入本机 Shell
 - macOS 默认使用 MesloLGS NF 字体并启用 256 色/真彩色终端环境，兼容 Powerlevel10k 提示符
 - 自适应终端尺寸

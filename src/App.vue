@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import packageJson from "../package.json";
@@ -18,7 +19,9 @@ type HostProfile = { id: string; name: string; host: string; port: number; usern
 type SessionKind = "local" | "ssh";
 type ConnectionState = "connected" | "connecting" | "disconnected";
 type TerminalSession = { id: string; kind: SessionKind; profile: HostProfile };
-type ThemeName = "graphite" | "midnight" | "paper" | "homebrew" | "dracula" | "nord" | "solarized" | "monokai";
+type ThemeName = "graphite" | "midnight" | "paper" | "homebrew" | "dracula" | "nord" | "solarized" | "monokai" | "macos-glass";
+type UpdateStatus = "idle" | "checking" | "current" | "available" | "error";
+type LatestRelease = { version: string; url: string };
 type SftpEntry = { name: string; path: string; isDir: boolean; size: number | null; modified: number | null };
 type TerminalRuntime = {
   terminal: Terminal;
@@ -37,6 +40,8 @@ type TerminalRuntime = {
 const APP_VERSION = packageJson.version;
 const APP_AUTHOR = "Zzbazinga";
 const MAX_SFTP_FILE_SIZE = 32 * 1024 * 1024;
+const LATEST_RELEASE_URL = "https://api.github.com/repos/zxkbazinga/apex-term/releases/latest";
+const DISMISSED_UPDATE_VERSION_KEY = "apex-dismissed-update-version";
 
 const profiles = ref<HostProfile[]>([]);
 const connectionStates = reactive<Record<string, ConnectionState>>({});
@@ -53,6 +58,7 @@ const availableThemes: { id: ThemeName; label: string }[] = [
   { id: "nord", label: "Nord" },
   { id: "solarized", label: "Solarized Dark" },
   { id: "monokai", label: "Monokai" },
+  { id: "macos-glass", label: "macOS 玻璃" },
   { id: "paper", label: "浅色" },
 ];
 const savedTheme = localStorage.getItem("apex-theme") as ThemeName | null;
@@ -64,6 +70,7 @@ if (migrateLegacyTheme) {
 }
 const theme = ref<ThemeName>(migrateLegacyTheme && savedTheme === "graphite" ? "homebrew" : availableThemes.some((item) => item.id === savedTheme) ? savedTheme! : "homebrew");
 const isMacOS = navigator.platform.toLowerCase().includes("mac");
+const isWindowsOS = navigator.platform.toLowerCase().includes("win");
 const defaultFontFamily = isMacOS ? "MesloLGS NF" : "DejaVu Sans Mono";
 const savedFontFamily = localStorage.getItem("apex-font");
 const fontFamily = ref(!savedFontFamily || (isMacOS && savedFontFamily === "Cascadia Code") ? defaultFontFamily : savedFontFamily);
@@ -78,6 +85,10 @@ const windowMenuOpen = ref(false);
 const settingsOpen = ref(false);
 const sessionsOpen = ref(false);
 const aboutOpen = ref(false);
+const updateStatus = ref<UpdateStatus>("idle");
+const latestRelease = ref<LatestRelease | null>(null);
+const updateError = ref("");
+const updateToastVisible = ref(false);
 const hostTrustRequest = ref<{ sessionId: string; profile: HostProfile; password: string; fingerprint: string; knownFingerprint?: string } | null>(null);
 const sftpOpen = ref(false);
 const sftpPath = ref(".");
@@ -178,6 +189,7 @@ async function syncNativeBackground() {
     nord: "#2e3440",
     solarized: "#002b36",
     monokai: "#272822",
+    "macos-glass": "#151b26",
   };
   const color = backgroundColors[theme.value];
   try {
@@ -202,6 +214,104 @@ function loadProfiles() {
 function setTheme(value: ThemeName) { theme.value = value; localStorage.setItem("apex-theme", value); }
 function setFont(value: string) { fontFamily.value = value; localStorage.setItem("apex-font", value); }
 function setFontSize(value: number) { fontSize.value = value; localStorage.setItem("apex-font-size", String(value)); }
+function parseVersion(value: string): [number, number, number] | null {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+function compareVersions(left: string, right: string): number | null {
+  const leftParts = parseVersion(left);
+  const rightParts = parseVersion(right);
+  if (!leftParts || !rightParts) return null;
+  for (let index = 0; index < leftParts.length; index += 1) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] - rightParts[index];
+  }
+  return 0;
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+async function checkForUpdates() {
+  updateStatus.value = "checking";
+  latestRelease.value = null;
+  updateError.value = "";
+  try {
+    const response = await fetch(LATEST_RELEASE_URL, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      cache: "no-store",
+    });
+    if (response.status === 403 || response.status === 429) {
+      throw new Error("GitHub API 请求暂时受限，请稍后重试。");
+    }
+    if (response.status === 404) {
+      throw new Error("GitHub 上还没有可检查的正式版本。");
+    }
+    if (!response.ok) throw new Error(`GitHub API 返回 HTTP ${response.status}。`);
+
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || typeof payload.tag_name !== "string" || typeof payload.html_url !== "string") {
+      throw new Error("GitHub 返回的版本信息格式无效。");
+    }
+    const releaseVersion = parseVersion(payload.tag_name);
+    if (!releaseVersion) throw new Error(`无法识别版本号：${payload.tag_name}`);
+    const releaseUrl = new URL(payload.html_url);
+    if (releaseUrl.origin !== "https://github.com" || !releaseUrl.pathname.startsWith("/zxkbazinga/apex-term/releases/tag/")) {
+      throw new Error("GitHub 返回的发布页面地址无效。");
+    }
+    latestRelease.value = { version: payload.tag_name, url: releaseUrl.toString() };
+    const comparison = compareVersions(payload.tag_name, APP_VERSION);
+    if (comparison === null) throw new Error(`无法比较当前版本号：${APP_VERSION}`);
+    updateStatus.value = comparison > 0 ? "available" : "current";
+  } catch (error) {
+    updateStatus.value = "error";
+    updateError.value = `检查更新失败：${error instanceof Error ? error.message : String(error)}`;
+    console.error(updateError.value, error);
+  }
+}
+async function checkForUpdatesAutomatically() {
+  await checkForUpdates();
+  const release = latestRelease.value;
+  if (updateStatus.value !== "available" || !release) return;
+  try {
+    updateToastVisible.value = localStorage.getItem(DISMISSED_UPDATE_VERSION_KEY) !== release.version;
+  } catch (error) {
+    console.error("读取已忽略的更新版本失败：", error);
+    updateToastVisible.value = true;
+  }
+}
+function dismissUpdateToast() {
+  const release = latestRelease.value;
+  if (release) {
+    try {
+      localStorage.setItem(DISMISSED_UPDATE_VERSION_KEY, release.version);
+    } catch (error) {
+      console.error("保存已忽略的更新版本失败：", error);
+    }
+  }
+  updateToastVisible.value = false;
+}
+function openUpdateDetails() {
+  dismissUpdateToast();
+  aboutOpen.value = true;
+}
+async function openLatestRelease() {
+  const release = latestRelease.value;
+  if (!release) return;
+  try {
+    if (runtimeAvailable.value) {
+      await openUrl(release.url);
+    } else {
+      const openedWindow = window.open(release.url, "_blank", "noopener,noreferrer");
+      if (!openedWindow) throw new Error("浏览器阻止了打开发布页面。");
+    }
+  } catch (error) {
+    updateError.value = `打开下载页面失败：${error instanceof Error ? error.message : String(error)}`;
+    console.error(updateError.value, error);
+  }
+}
 function setWallpaperTransparency(value: number) {
   wallpaperTransparency.value = value;
   localStorage.setItem("apex-wallpaper-transparency", String(value));
@@ -598,6 +708,11 @@ function getTerminalPalette(value: ThemeName) {
       background: "#272822", foreground: "#f8f8f2", cursor: "#f8f8f0", selectionBackground: "#49483e",
       black: "#272822", red: "#f92672", green: "#a6e22e", yellow: "#f4bf75", blue: "#66d9ef", magenta: "#ae81ff", cyan: "#a1efe4", white: "#f8f8f2",
       brightBlack: "#75715e", brightRed: "#f92672", brightGreen: "#a6e22e", brightYellow: "#f4bf75", brightBlue: "#66d9ef", brightMagenta: "#ae81ff", brightCyan: "#a1efe4", brightWhite: "#f9f8f5",
+    },
+    "macos-glass": {
+      background: "#151b26", foreground: "#e5edf8", cursor: "#d7e5ff", selectionBackground: "#536985",
+      black: "#151b26", red: "#ff7f8e", green: "#83d6a5", yellow: "#f3ce83", blue: "#8ab8ff", magenta: "#d4a9f5", cyan: "#82d8e2", white: "#dce6f2",
+      brightBlack: "#7c8ca2", brightRed: "#ff9daa", brightGreen: "#a6e9bd", brightYellow: "#ffe2a1", brightBlue: "#a9cbff", brightMagenta: "#e1c0fb", brightCyan: "#a2e8ef", brightWhite: "#f5f8ff",
     },
   } satisfies Record<ThemeName, Terminal["options"]["theme"]>;
   const palette = palettes[value];
@@ -1066,6 +1181,9 @@ onMounted(loadProfiles);
 onMounted(() => {
   if (runtimeAvailable.value) startLocalSession();
 });
+onMounted(() => {
+  if (runtimeAvailable.value) void checkForUpdatesAutomatically();
+});
 onUnmounted(() => {
   window.removeEventListener("keydown", handleApplicationShortcut, true);
   unlistenNativeMenu?.();
@@ -1142,7 +1260,7 @@ onUnmounted(() => {
 
     <div class="app-body">
       <section class="main-panel">
-        <div v-if="isMacOS && runtimeAvailable" class="session-strip app-titlebar">
+        <div v-if="(isMacOS || isWindowsOS) && runtimeAvailable" class="session-strip" :class="{ 'app-titlebar': isMacOS }">
           <div v-for="session in sessions" :key="session.id" class="session-tab" :class="{ 'session-tab-active': activeSessionId === session.id }" @click="activeSessionId = session.id">
             <span class="tab-live-dot" :class="sessionStates[session.id] || 'disconnected'"></span>
             <TerminalSquare :size="15" />
@@ -1244,6 +1362,16 @@ onUnmounted(() => {
         <p class="about-version">版本 {{ APP_VERSION }}</p>
         <p class="about-description">一款简洁的桌面终端与 SSH 会话管理工具。</p>
         <p class="about-author">作者：{{ APP_AUTHOR }}</p>
+        <div class="about-update">
+          <button class="secondary-button" type="button" :disabled="updateStatus === 'checking'" @click="checkForUpdates">
+            <RefreshCw :size="14" :class="{ spin: updateStatus === 'checking' }" />
+            {{ updateStatus === "checking" ? "检查中…" : "检查更新" }}
+          </button>
+          <p v-if="updateStatus === 'current'" class="update-message" role="status">当前已是最新版本（{{ APP_VERSION }}）。</p>
+          <p v-if="updateStatus === 'available' && latestRelease" class="update-message" role="status">发现新版本 {{ latestRelease.version }}。</p>
+          <p v-if="updateError" class="update-error" role="alert">{{ updateError }}</p>
+          <button v-if="updateStatus === 'available'" class="primary-button" type="button" @click="openLatestRelease"><Download :size="14" /> 前往 GitHub 下载</button>
+        </div>
         <div class="about-credits">Built with Tauri · Vue · Rust</div>
         <button class="secondary-button about-close" type="button" @click="aboutOpen = false">关闭</button>
       </section>
@@ -1261,6 +1389,15 @@ onUnmounted(() => {
         </div>
       </section>
     </div>
+    <section v-if="updateToastVisible && latestRelease" class="update-toast" role="status" aria-live="polite" aria-label="发现软件更新">
+      <div class="update-toast-icon"><Download :size="17" /></div>
+      <div class="update-toast-copy">
+        <strong>Apex Term 有新版本</strong>
+        <span>{{ latestRelease.version }} 已发布。</span>
+        <button class="update-toast-action" type="button" @click="openUpdateDetails">查看更新详情</button>
+      </div>
+      <button class="update-toast-close" type="button" :aria-label="`忽略 ${latestRelease.version} 更新提示`" @click="dismissUpdateToast"><X :size="15" /></button>
+    </section>
     <div v-if="sftpOpen" class="modal-backdrop sftp-backdrop" @click.self="sftpOpen = false">
       <section class="sftp-modal" role="dialog" aria-modal="true" aria-labelledby="sftp-title">
         <header class="sftp-header">
@@ -1300,10 +1437,11 @@ onUnmounted(() => {
 @import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
 :root { font-family: "DM Sans", "Segoe UI", sans-serif; font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; font-optical-sizing: auto; font-size: 14px; font-weight: 400; color: #282e2b; background: #050505; }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 360px; min-height: 100vh; background: #050505; }
+html, body, #app { width: 100%; height: 100%; overflow: hidden; }
+body { margin: 0; min-width: 360px; min-height: 0; background: #050505; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
-.app-shell { --canvas:#f4f4ef; --sidebar:#fbfbf7; --surface:#fff; --surface-muted:#f2f3ed; --text:#29312d; --text-soft:#68736c; --text-faint:#9aa29b; --border:#e6e8e1; --accent:#577d60; --accent-bright:#a5d38c; height:100vh; min-height:560px; overflow:hidden; color:var(--text); background:var(--canvas); display:flex; flex-direction:column; }
+.app-shell { --canvas:#f4f4ef; --sidebar:#fbfbf7; --surface:#fff; --surface-muted:#f2f3ed; --text:#29312d; --text-soft:#68736c; --text-faint:#9aa29b; --border:#e6e8e1; --accent:#577d60; --accent-bright:#a5d38c; height:100%; min-height:0; overflow:hidden; color:var(--text); background:var(--canvas); display:flex; flex-direction:column; }
 .app-shell.theme-paper { --canvas:#f6f4ee; --sidebar:#fffefa; --surface:#fffefa; --surface-muted:#f1f0e9; --text:#3d403a; --text-soft:#797d73; --text-faint:#a3a59a; --border:#e8e5dc; --accent:#8b7050; --accent-bright:#d3b783; }
 .app-shell.theme-homebrew { --canvas:#050805; --sidebar:#080d08; --surface:#0a100a; --surface-muted:#101a10; --text:#c7f5c7; --text-soft:#83bb83; --text-faint:#527852; --border:#183018; --accent:#00b800; --accent-bright:#00ff00; }
 .session-tab,.welcome-footnote,.modal-header,.modal-actions { display:flex; align-items:center; }
@@ -1428,6 +1566,8 @@ button { cursor: pointer; }
 .terminal-stage.has-wallpaper::after { z-index:-1; background:var(--canvas); opacity:var(--wallpaper-overlay-opacity); }
 .terminal-stage.has-wallpaper .terminal-mount { z-index:0; }
 .terminal-stage.has-wallpaper .terminal-mount .xterm .xterm-viewport { background-color:transparent !important; }
+.terminal-mount .xterm-viewport { scrollbar-width:none; }
+.terminal-mount .xterm-viewport::-webkit-scrollbar { display:none; width:0; height:0; }
 .app-titlebar { position:relative; z-index:11; height:46px; min-height:46px; flex:0 0 46px; overflow:visible; padding:0 0 0 15px; user-select:none; color:var(--text); background:var(--sidebar); border-color:var(--border); }
 .app-titlebar .session-tab { min-width:72px; max-width:240px; flex:0 1 auto; overflow:hidden; color:var(--text-soft); }
 .app-titlebar .session-tab-active { color:var(--text); background:var(--surface-muted); box-shadow:inset 0 -2px var(--accent); }
@@ -1512,6 +1652,114 @@ button { cursor: pointer; }
 .app-shell .connection-modal .primary-button:hover,.app-shell .modal-submit:hover { color:#041008; background:linear-gradient(180deg,#b4ffc5,#7be99a); box-shadow:inset 0 1px #ffffffc7,0 7px 18px #00a63d45; }
 .app-shell .modal-close { border-color:#ffffff20; background:linear-gradient(180deg,#ffffff12,#ffffff07); box-shadow:inset 0 1px #ffffff0c; }
 .app-shell .modal-close:hover { border-color:#ffffff38; background:#ffffff18; }
+.about-update { display:flex; flex-direction:column; align-items:center; gap:9px; margin:15px 0; }
+.about-update .secondary-button,.about-update .primary-button { min-height:34px; }
+.update-message,.update-error { max-width:280px; margin:0; font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
+.update-message { color:var(--text-soft); }
+.update-error { color:#ffaaa3; }
+.update-toast {
+  position:fixed;
+  z-index:4;
+  top:58px;
+  right:18px;
+  width:min(360px,calc(100vw - 28px));
+  display:grid;
+  grid-template-columns:34px minmax(0,1fr) 24px;
+  align-items:start;
+  gap:11px;
+  padding:13px;
+  border:1px solid var(--border);
+  border-radius:14px;
+  color:var(--text);
+  background:var(--sidebar);
+  box-shadow:0 18px 48px #0007,inset 0 1px #ffffff18;
+  -webkit-backdrop-filter:blur(24px) saturate(145%);
+  backdrop-filter:blur(24px) saturate(145%);
+}
+.update-toast-icon { width:34px; height:34px; display:grid; place-items:center; border-radius:10px; color:var(--accent); background:var(--surface-muted); }
+.update-toast-copy { min-width:0; display:flex; flex-direction:column; gap:4px; padding-top:1px; }
+.update-toast-copy strong { color:var(--text); font-size:11px; font-weight:600; }
+.update-toast-copy span { color:var(--text-soft); font-size:10px; }
+.update-toast-action { align-self:flex-start; margin:3px 0 0; padding:0; border:0; color:var(--accent); background:transparent; font-size:10px; font-weight:600; }
+.update-toast-action:hover { text-decoration:underline; }
+.update-toast-close { width:24px; height:24px; display:grid; place-items:center; padding:0; border:0; border-radius:7px; color:var(--text-faint); background:transparent; }
+.update-toast-close:hover { color:var(--text); background:var(--surface-muted); }
+.app-shell.theme-macos-glass {
+  --canvas:#111722;
+  --sidebar:#202a38e8;
+  --surface:#2a3545d9;
+  --surface-muted:#46546a70;
+  --text:#eaf1fa;
+  --text-soft:#c2ccda;
+  --text-faint:#92a0b2;
+  --border:#dce8f226;
+  --accent:#a9c8ff;
+  --accent-bright:#d1e2ff;
+  background:
+    radial-gradient(ellipse at 17% 3%,#779bd52b,transparent 42%),
+    radial-gradient(ellipse at 86% 96%,#a481db22,transparent 40%),
+    linear-gradient(135deg,#171e2a,#10151e 62%,#1b202b);
+}
+.theme-macos-glass .main-panel {
+  background:
+    radial-gradient(ellipse at 20% 12%,#799bd31c,transparent 40%),
+    radial-gradient(ellipse at 82% 86%,#a481db16,transparent 38%),
+    linear-gradient(135deg,#151c27,#10151e 62%,#191e29);
+}
+.theme-macos-glass .session-strip {
+  border-color:#dce8f21c;
+  background:linear-gradient(180deg,#313d50d9,#18212cdb);
+}
+.theme-macos-glass .terminal-stage {
+  margin:14px 16px 10px;
+  border-color:#dce8f229;
+  border-radius:16px;
+  background:linear-gradient(145deg,#202a39,#141b26);
+  box-shadow:0 12px 36px #05091280,inset 0 1px #ffffff18;
+  -webkit-backdrop-filter:blur(26px) saturate(155%);
+  backdrop-filter:blur(26px) saturate(155%);
+}
+.theme-macos-glass .session-tab-active,.theme-macos-glass .app-titlebar .session-tab-active {
+  color:#f3f7ff;
+  border-color:#9bbcff65;
+  background:linear-gradient(180deg,#627da34d,#4053714d);
+  box-shadow:inset 0 1px #e3edff24,0 3px 12px #6699f326;
+}
+.theme-macos-glass .session-tab-active:hover,.theme-macos-glass .app-titlebar .session-tab-active:hover {
+  border-color:#b5ceff85;
+  background:linear-gradient(180deg,#718db65c,#4c61805c);
+}
+.theme-macos-glass .welcome-stage {
+  background:
+    radial-gradient(ellipse at 22% 12%,#779bd52b,transparent 40%),
+    radial-gradient(ellipse at 78% 88%,#a481db24,transparent 42%),
+    linear-gradient(135deg,#171e2a,#10151e 62%,#1b202b);
+}
+.theme-macos-glass .welcome-content h2 { color:#e7eef9; }
+.theme-macos-glass .welcome-content h2 em { color:#a9c8ff; }
+.theme-macos-glass .welcome-content p,.theme-macos-glass .welcome-footnote { color:#adbacb; }
+.theme-macos-glass .welcome-terminal {
+  border-color:#a9c8ff6b;
+  color:#edf4ff;
+  background:linear-gradient(145deg,#667fa966,#35445b99);
+  box-shadow:0 9px 24px #060a1380,inset 0 1px #ffffff42;
+  -webkit-backdrop-filter:blur(16px);
+  backdrop-filter:blur(16px);
+}
+.theme-macos-glass .welcome-terminal i { background:#c7dcff; }
+.theme-macos-glass .update-toast {
+  border-color:#dce8f240;
+  background:linear-gradient(145deg,#283547ed,#182130ed);
+}
+.theme-macos-glass .connection-modal .primary-button,.theme-macos-glass .modal-submit {
+  color:#111722;
+  border-color:#d2e2ff8c;
+  background:linear-gradient(180deg,#d9e7ff,#9dbdf4);
+  box-shadow:inset 0 1px #ffffffb3,0 5px 14px #608ed63b;
+}
+.theme-macos-glass .connection-modal .primary-button:hover,.theme-macos-glass .modal-submit:hover {
+  background:linear-gradient(180deg,#e7efff,#b2ccfa);
+}
 @media (prefers-reduced-motion: reduce) {
   .session-tab,.new-tab-button,.app-titlebar .new-tab-button { transition:none; }
 }
