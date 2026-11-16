@@ -1,9 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="background" x1="120" y1="80" x2="900" y2="940" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#172638"/>
-      <stop offset="1" stop-color="#09121d"/>
-    </linearGradient>
     <linearGradient id="terminal" x1="170" y1="178" x2="844" y2="812" gradientUnits="userSpaceOnUse">
       <stop stop-color="#1b2b39"/>
       <stop offset="1" stop-color="#101a26"/>
@@ -13,7 +9,6 @@
       <stop offset="1" stop-color="#f6a92f"/>
     </linearGradient>
   </defs>
-  <rect x="36" y="36" width="952" height="952" rx="236" fill="url(#background)"/>
   <rect x="126" y="164" width="772" height="650" rx="72" fill="url(#terminal)" stroke="#47dbc0" stroke-width="26"/>
   <path d="M198 178h628a57 57 0 0 1 57 57v91H155v-91a57 57 0 0 1 43-57Z" fill="#203545"/>
   <path d="M155 326h728" stroke="#3b5968" stroke-width="14"/>
