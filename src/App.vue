@@ -7,6 +7,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
+import type { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import packageJson from "../package.json";
 import {
@@ -729,6 +730,25 @@ function setTerminalElement(sessionId: string, element: unknown) {
   if (session && !terminalRuntimes.has(sessionId)) createTerminal(session, element);
 }
 
+async function enableGpuRenderer(sessionId: string, terminal: Terminal) {
+  let webglAddon: WebglAddon | undefined;
+  try {
+    const { WebglAddon: WebGLAddon } = await import("@xterm/addon-webgl");
+    if (terminalRuntimes.get(sessionId)?.terminal !== terminal) return;
+    webglAddon = new WebGLAddon();
+    webglAddon.onContextLoss(() => {
+      console.warn("终端 WebGL 上下文丢失，已切换到 CPU 渲染");
+      webglAddon?.dispose();
+    });
+    terminal.loadAddon(webglAddon);
+  } catch (error) {
+    webglAddon?.dispose();
+    if (terminalRuntimes.get(sessionId)?.terminal === terminal) {
+      console.warn("终端 GPU 渲染不可用，已切换到 CPU 渲染：", error);
+    }
+  }
+}
+
 function createTerminal(session: TerminalSession, element: HTMLElement) {
   const terminal = new Terminal({
     cursorBlink: true,
@@ -836,6 +856,7 @@ function createTerminal(session: TerminalSession, element: HTMLElement) {
     terminal.writeln(`\r\n\x1b[31m无法监听终端输出：${String(error)}\x1b[0m\r\n`);
   });
   runtime.resizeObserver.observe(element);
+  void enableGpuRenderer(session.id, terminal);
 }
 
 function scheduleTerminalResize(session: TerminalSession, runtime: TerminalRuntime, delay = 0) {
