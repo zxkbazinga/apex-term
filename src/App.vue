@@ -1165,13 +1165,20 @@ async function closeSession(sessionId = activeSessionId.value) {
   }
 }
 
-watch([theme, fontFamily, fontSize, wallpaper, wallpaperTransparency], async ([nextTheme, nextFont, nextSize]) => {
+watch([theme, fontFamily, fontSize, wallpaper, wallpaperTransparency], async ([nextTheme, nextFont, nextSize], [, previousFont, previousSize]) => {
+  const fontChanged = nextFont !== previousFont || nextSize !== previousSize;
   for (const runtime of terminalRuntimes.values()) {
     runtime.terminal.options.fontFamily = `"${nextFont}", Menlo, "SFMono-Regular", Consolas, monospace`;
     runtime.terminal.options.fontSize = nextSize;
     runtime.terminal.options.theme = getTerminalPalette(nextTheme);
   }
   await nextTick();
+  if (fontChanged) {
+    for (const runtime of terminalRuntimes.values()) {
+      const lastRow = runtime.terminal.rows - 1;
+      if (lastRow >= 0) runtime.terminal.refresh(0, lastRow);
+    }
+  }
   if (theme.value === nextTheme) void syncNativeBackground();
   for (const [sessionId, runtime] of terminalRuntimes) {
     if (sessionId === activeSessionId.value) {
@@ -1781,6 +1788,164 @@ button { cursor: pointer; }
 .theme-macos-glass .connection-modal .primary-button:hover,.theme-macos-glass .modal-submit:hover {
   background:linear-gradient(180deg,#e7efff,#b2ccfa);
 }
+.app-shell {
+  --dialog-overlay:#17201a80;
+  --dialog-shadow:0 22px 70px #17201a35;
+  --dialog-backdrop-filter:blur(3px);
+  --dialog-surface-filter:none;
+  --dialog-error:#a34e47;
+  --dialog-error-background:#fff7f5;
+  --dialog-error-border:#efd7d3;
+  --dialog-warning:#8a6b22;
+  --dialog-warning-background:#fbf4df;
+  --dialog-warning-border:#e3d39a;
+}
+.app-shell.theme-midnight,.app-shell.theme-graphite,.app-shell.theme-homebrew,.app-shell.theme-dracula,.app-shell.theme-nord,.app-shell.theme-solarized,.app-shell.theme-monokai,.app-shell.theme-macos-glass {
+  --dialog-overlay:#030605a6;
+  --dialog-shadow:0 28px 80px #0009;
+  --dialog-error:#ffaaa3;
+  --dialog-error-background:#271614;
+  --dialog-error-border:#5d302d;
+  --dialog-warning:#e6d39a;
+  --dialog-warning-background:#211c10;
+  --dialog-warning-border:#66572e;
+}
+.app-shell.theme-macos-glass {
+  --dialog-backdrop-filter:blur(8px) saturate(115%);
+  --dialog-surface-filter:blur(28px) saturate(150%);
+  --dialog-shadow:0 30px 90px #000b,0 8px 24px #0006,inset 0 1px #ffffff18;
+}
+.app-shell .modal-backdrop {
+  background:var(--dialog-overlay);
+  -webkit-backdrop-filter:var(--dialog-backdrop-filter);
+  backdrop-filter:var(--dialog-backdrop-filter);
+}
+.app-shell .sessions-popover,.app-shell .settings-popover,.app-shell .connection-modal,.app-shell .about-modal,.app-shell .sftp-modal {
+  color:var(--text);
+  border-color:var(--border);
+  background:var(--sidebar);
+  box-shadow:var(--dialog-shadow);
+  -webkit-backdrop-filter:var(--dialog-surface-filter);
+  backdrop-filter:var(--dialog-surface-filter);
+}
+.app-shell .sessions-popover-heading,.app-shell .settings-title,.app-shell .settings-select,.app-shell .modal-header h2,.app-shell .about-modal h2,.app-shell .sftp-heading h2 {
+  color:var(--text);
+}
+.app-shell .sessions-popover-heading button,.app-shell .settings-select select,.app-shell .sessions-popover .search-box {
+  color:var(--text);
+  border-color:var(--border);
+  background:var(--surface);
+  box-shadow:none;
+}
+.app-shell .sessions-popover-heading button { color:var(--accent); }
+.app-shell .sessions-popover-heading button:hover,.app-shell .settings-select select:focus { border-color:var(--accent); background:var(--surface-muted); }
+.app-shell .settings-select select option { color:var(--text); background:var(--surface); }
+.app-shell .sessions-popover .search-box input,.app-shell .field-label input,.app-shell .sftp-path-form input { color:var(--text); }
+.app-shell .sessions-popover .search-box input::placeholder,.app-shell .field-label input::placeholder { color:var(--text-faint); }
+.app-shell .saved-session { color:var(--text-soft); }
+.app-shell .saved-session-copy strong { color:var(--text); }
+.app-shell .saved-session-copy small,.app-shell .sessions-footnote,.app-shell .sessions-empty { color:var(--text-faint); }
+.app-shell .saved-session-row:hover,.app-shell .saved-session.active { background:var(--surface-muted); box-shadow:none; }
+.app-shell .sessions-divider { background:var(--border); }
+.app-shell .saved-session-delete,.app-shell .saved-session-edit { color:var(--text-faint); }
+.app-shell .saved-session-delete:hover { color:var(--dialog-error); background:var(--dialog-error-background); }
+.app-shell .connection-modal,.app-shell .about-modal,.app-shell .sftp-modal { border-radius:18px; }
+.app-shell .modal-icon,.app-shell .about-mark {
+  border:1px solid var(--border);
+  color:var(--accent);
+  background:var(--surface-muted);
+  box-shadow:none;
+}
+.app-shell .eyebrow,.app-shell .connection-modal .eyebrow { color:var(--text-faint); }
+.app-shell .field-label { color:var(--text-soft); }
+.app-shell .field-label input {
+  border-color:var(--border);
+  background:var(--surface);
+}
+.app-shell .field-label input:focus,.app-shell .sftp-path-form:focus-within {
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--surface-muted);
+}
+.app-shell .credential-note,.app-shell .about-description,.app-shell .about-author,.app-shell .fingerprint-arrow { color:var(--text-soft); }
+.app-shell .credential-note svg { color:var(--accent); }
+.app-shell .modal-actions,.app-shell .about-credits,.app-shell .sftp-header,.app-shell .sftp-toolbar,.app-shell .sftp-footer { border-color:var(--border); }
+.app-shell .secondary-button {
+  color:var(--text-soft);
+  border-color:var(--border);
+  background:var(--surface);
+  box-shadow:none;
+}
+.app-shell .secondary-button:hover { color:var(--text); border-color:var(--accent); background:var(--surface-muted); }
+.app-shell .connection-modal .primary-button,.app-shell .about-modal .primary-button,.app-shell .modal-submit {
+  color:var(--canvas);
+  border:1px solid var(--accent);
+  background:var(--accent);
+  box-shadow:none;
+}
+.app-shell .connection-modal .primary-button:hover,.app-shell .about-modal .primary-button:hover,.app-shell .modal-submit:hover {
+  color:var(--canvas);
+  background:var(--accent);
+  border-color:var(--accent);
+  box-shadow:none;
+  filter:brightness(1.08);
+}
+.app-shell .modal-close {
+  color:var(--text-soft);
+  border-color:var(--border);
+  background:var(--surface);
+  box-shadow:none;
+}
+.app-shell .modal-close:hover { color:var(--text); border-color:var(--accent); background:var(--surface-muted); }
+.app-shell .sftp-toolbar { background:var(--sidebar); }
+.app-shell .sftp-tool-button,.app-shell .sftp-path-form {
+  color:var(--text-soft);
+  border-color:var(--border);
+  background:var(--surface);
+}
+.app-shell .sftp-tool-button:hover:not(:disabled) { color:var(--accent); border-color:var(--accent); }
+.app-shell .sftp-path-form input { background:transparent; }
+.app-shell .sftp-path-form button { color:var(--text-soft); border-color:var(--border); }
+.app-shell .sftp-columns { color:var(--text-faint); background:var(--surface-muted); }
+.app-shell .sftp-entry { color:var(--text-soft); border-color:var(--border); }
+.app-shell .sftp-entry:hover { background:var(--surface-muted); }
+.app-shell .sftp-entry-name { color:var(--accent); }
+.app-shell .sftp-entry-name span { color:var(--text); }
+.app-shell .sftp-entry-size,.app-shell .sftp-entry-actions button,.app-shell .sftp-empty,.app-shell .sftp-footer { color:var(--text-faint); }
+.app-shell .sftp-entry-actions button:hover { color:var(--dialog-error); background:var(--dialog-error-background); }
+.app-shell .form-error,.app-shell .sftp-error,.app-shell .update-error,.app-shell .wallpaper-error { color:var(--dialog-error); }
+.app-shell .sftp-error {
+  border-color:var(--dialog-error-border);
+  background:var(--dialog-error-background);
+}
+.app-shell .host-fingerprint {
+  color:var(--accent);
+  border-color:var(--border);
+  background:var(--surface);
+}
+.app-shell .known-fingerprint {
+  color:var(--dialog-error);
+  border-color:var(--dialog-error-border);
+  background:var(--dialog-error-background);
+}
+.app-shell .fingerprint-arrow { color:var(--text-soft); }
+.app-shell .fingerprint-confirm {
+  color:var(--dialog-warning);
+  border-color:var(--dialog-warning-border);
+  background:var(--dialog-warning-background);
+}
+.app-shell .fingerprint-confirm code { color:var(--dialog-warning); }
+.app-shell .test-status { color:var(--accent-bright); }
+.app-shell .delete-profile-modal .about-mark {
+  color:var(--dialog-error);
+  border-color:var(--dialog-error-border);
+  background:var(--dialog-error-background);
+}
+.app-shell .danger-button {
+  color:#fff;
+  border-color:#813d39;
+  background:#8f3934;
+}
+.app-shell .danger-button:hover:not(:disabled) { background:#a6443e; }
 @media (prefers-reduced-motion: reduce) {
   .session-tab,.new-tab-button,.app-titlebar .new-tab-button { transition:none; }
 }
