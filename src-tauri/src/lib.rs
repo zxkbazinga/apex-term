@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -12,14 +13,208 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use serde::Serialize;
 use socket2::{SockRef, TcpKeepalive};
 use ssh2::Channel;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_SFTP_FILE_SIZE: usize = 32 * 1024 * 1024;
+const MAX_UPDATE_DOWNLOAD_SIZE: u64 = 1024 * 1024 * 1024;
 const CREDENTIAL_SERVICE: &str = "com.zzbazinga.apex-term";
 
 #[tauri::command]
 fn app_exit(app: AppHandle) {
     app.exit(0);
+}
+
+#[derive(Clone, Serialize)]
+struct UpdateDownloadProgress {
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+}
+
+fn update_download_path(
+    download_dir: &Path,
+    file_name: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    if file_name.is_empty()
+        || file_name
+            .chars()
+            .any(|character| matches!(character, '/' | '\\' | ':') || character.is_control())
+    {
+        return Err("更新安装包文件名无效".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let supported = file_name.to_lowercase().ends_with(".dmg");
+    #[cfg(target_os = "windows")]
+    let supported = {
+        let name = file_name.to_lowercase();
+        name.ends_with(".msi") || name.ends_with(".exe")
+    };
+    #[cfg(target_os = "linux")]
+    let supported = {
+        let name = file_name.to_lowercase();
+        name.ends_with(".appimage") || name.ends_with(".deb") || name.ends_with(".rpm")
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let supported = false;
+    if !supported {
+        return Err("该安装包格式与当前系统不兼容".to_string());
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "更新安装包文件名无效".to_string())?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "更新安装包缺少文件扩展名".to_string())?;
+
+    for suffix in 0..=999 {
+        let name = if suffix == 0 {
+            file_name.to_string()
+        } else {
+            format!("{stem} ({suffix}).{extension}")
+        };
+        let destination = download_dir.join(&name);
+        let partial = download_dir.join(format!("{name}.part"));
+        if !destination.exists() && !partial.exists() {
+            return Ok((destination, partial));
+        }
+    }
+    Err("下载目录中存在过多同名安装包".to_string())
+}
+
+fn is_allowed_update_host(host: &str) -> bool {
+    matches!(
+        host,
+        "github.com"
+            | "release-assets.githubusercontent.com"
+            | "objects.githubusercontent.com"
+            | "github-releases.githubusercontent.com"
+    )
+}
+
+#[tauri::command]
+async fn download_update(app: AppHandle, url: String, file_name: String) -> Result<String, String> {
+    let asset_url = reqwest::Url::parse(&url).map_err(|error| format!("更新地址无效：{error}"))?;
+    if asset_url.scheme() != "https"
+        || asset_url.host_str() != Some("github.com")
+        || !asset_url
+            .path()
+            .starts_with("/zxkbazinga/apex-term/releases/download/")
+    {
+        return Err("只允许下载 Apex Term 官方 GitHub Release 安装包".to_string());
+    }
+
+    let download_dir = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("无法获取系统下载目录：{error}"))?;
+    fs::create_dir_all(&download_dir).map_err(|error| format!("无法创建下载目录：{error}"))?;
+    let (destination, partial) = update_download_path(&download_dir, &file_name)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30 * 60))
+        .user_agent(format!("ApexTerm/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let url = attempt.url();
+            if attempt.previous().len() < 10
+                && url.scheme() == "https"
+                && matches!(url.host_str(), Some(host) if is_allowed_update_host(host))
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(|error| format!("无法初始化更新下载：{error}"))?;
+    let mut response = client
+        .get(asset_url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await
+        .map_err(|error| format!("连接更新服务器失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("更新服务器返回 HTTP {}", response.status()));
+    }
+    if !response
+        .url()
+        .host_str()
+        .is_some_and(is_allowed_update_host)
+    {
+        return Err("更新下载被重定向到非可信服务器".to_string());
+    }
+
+    let total_bytes = response.content_length();
+    if total_bytes.is_some_and(|size| size > MAX_UPDATE_DOWNLOAD_SIZE) {
+        return Err("更新安装包超过 1 GB，已取消下载".to_string());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .map_err(|error| format!("无法写入下载文件：{error}"))?;
+    let mut downloaded_bytes = 0_u64;
+    let mut last_progress = Instant::now();
+    let download_result = async {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("下载更新包失败：{error}"))?
+        {
+            downloaded_bytes += chunk.len() as u64;
+            if downloaded_bytes > MAX_UPDATE_DOWNLOAD_SIZE {
+                return Err("更新安装包超过 1 GB，已取消下载".to_string());
+            }
+            file.write_all(&chunk)
+                .map_err(|error| format!("保存更新安装包失败：{error}"))?;
+            if last_progress.elapsed() >= Duration::from_millis(200) {
+                let _ = app.emit(
+                    "update-download-progress",
+                    UpdateDownloadProgress {
+                        downloaded_bytes,
+                        total_bytes,
+                    },
+                );
+                last_progress = Instant::now();
+            }
+        }
+        file.flush()
+            .map_err(|error| format!("保存更新安装包失败：{error}"))?;
+        if downloaded_bytes == 0 {
+            return Err("更新服务器返回了空安装包".to_string());
+        }
+        Ok(())
+    }
+    .await;
+    drop(file);
+    if let Err(error) = download_result {
+        let _ = fs::remove_file(&partial);
+        return Err(error);
+    }
+    #[cfg(target_os = "linux")]
+    if file_name.to_lowercase().ends_with(".appimage") {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) = fs::set_permissions(&partial, fs::Permissions::from_mode(0o755)) {
+            let _ = fs::remove_file(&partial);
+            return Err(format!("无法设置 AppImage 执行权限：{error}"));
+        }
+    }
+    if let Err(error) = fs::rename(&partial, &destination) {
+        let _ = fs::remove_file(&partial);
+        return Err(format!("无法完成更新安装包保存：{error}"));
+    }
+    let _ = app.emit(
+        "update-download-progress",
+        UpdateDownloadProgress {
+            downloaded_bytes,
+            total_bytes,
+        },
+    );
+    Ok(destination.to_string_lossy().into_owned())
 }
 
 fn credential_entry(profile_id: &str) -> Result<Entry, String> {
@@ -971,6 +1166,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_exit,
+            download_update,
             credential_store,
             credential_get,
             credential_delete,
