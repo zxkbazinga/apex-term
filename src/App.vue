@@ -824,7 +824,9 @@ function createTerminal(session: TerminalSession, element: HTMLElement) {
     runtime.writeQueue = runtime.writeQueue
       .then(() => invoke<void>(command, { sessionId: session.id, data }))
       .catch((error: unknown) => {
-        terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+        if (terminalRuntimes.get(session.id) === runtime) {
+          terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+        }
       });
   };
   terminal.onData((data) => {
@@ -1154,15 +1156,11 @@ async function closeSession(sessionId = activeSessionId.value) {
   if (!session) return;
   const runtime = terminalRuntimes.get(sessionId);
   runtime?.flushInput();
+  const pendingWrites = runtime?.writeQueue;
   sessionStates[sessionId] = "disconnected";
-  await runtime?.writeQueue;
   if (session.kind === "local" || sessions.value.filter((item) => item.profile.id === session.profile.id).length === 1) {
     connectionStates[session.profile.id] = "disconnected";
   }
-  const command = session.kind === "local" ? "local_stop" : "ssh_disconnect";
-  await invoke(command, { sessionId }).catch((error: unknown) => {
-    console.error(`关闭会话失败：${String(error)}`);
-  });
   if (hostTrustRequest.value?.sessionId === sessionId) cancelHostTrust();
   destroyTerminal(sessionId);
   pendingPasswords.delete(sessionId);
@@ -1174,6 +1172,11 @@ async function closeSession(sessionId = activeSessionId.value) {
   if (activeSessionId.value === sessionId) {
     activeSessionId.value = sessions.value[Math.max(0, index - 1)]?.id || sessions.value[0]?.id || null;
   }
+  const command = session.kind === "local" ? "local_stop" : "ssh_disconnect";
+  await pendingWrites;
+  await invoke(command, { sessionId }).catch((error: unknown) => {
+    console.error(`关闭会话失败：${String(error)}`);
+  });
 }
 
 watch([appearanceMode, systemIsDark], () => { void syncNativeBackground(); });
