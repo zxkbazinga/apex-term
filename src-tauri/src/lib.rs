@@ -1134,6 +1134,7 @@ pub fn run() {
                     .item(&MenuItemBuilder::with_id("open-settings", "外观").build(app)?)
                     .build()?;
                 let sessions = SubmenuBuilder::new(app, "会话")
+                    .item(&MenuItemBuilder::with_id("open-local-terminal", "本机终端").build(app)?)
                     .item(&MenuItemBuilder::with_id("manage-sessions", "会话列表").build(app)?)
                     .item(&MenuItemBuilder::with_id("add-session", "添加 SSH 主机…").build(app)?)
                     .build()?;

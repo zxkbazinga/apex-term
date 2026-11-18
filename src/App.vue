@@ -10,7 +10,7 @@ import type { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import packageJson from "../package.json";
 import {
-  Check, ChevronDown, Download, File, Folder, FolderPlus, Plus,
+  ArrowRight, Check, ChevronDown, Download, File, Folder, FolderPlus, Plus,
   RefreshCw, Server, Settings2, TerminalSquare, Trash2, Upload, X,
 } from "lucide-vue-next";
 import "@xterm/xterm/css/xterm.css";
@@ -439,6 +439,9 @@ function handleMenuAction(payload: string) {
   } else if (payload === "manage-sessions") {
     sessionsOpen.value = !sessionsOpen.value;
     settingsOpen.value = false;
+  } else if (payload === "open-local-terminal") {
+    closeMenuPanels();
+    startLocalSession();
   } else if (payload === "add-session") {
     closeMenuPanels();
     openNewProfile();
@@ -596,16 +599,23 @@ async function startLocalSessionFromMenu() {
 
 function destroyTerminal(sessionId: string) {
   const runtime = terminalRuntimes.get(sessionId);
-  if (!runtime) return;
+  if (!runtime) {
+    terminalElements.delete(sessionId);
+    return;
+  }
   if (runtime.resizeTimer) clearTimeout(runtime.resizeTimer);
   runtime.flushInput();
   terminalElements.get(sessionId)?.removeEventListener("keydown", runtime.clipboardKeyHandler, true);
   runtime.outputUnlisten?.();
   runtime.connectionEndedUnlisten?.();
   runtime.resizeObserver.disconnect();
-  runtime.terminal.dispose();
   terminalRuntimes.delete(sessionId);
   terminalElements.delete(sessionId);
+  try {
+    runtime.terminal.dispose();
+  } catch (error) {
+    console.error(`释放会话 ${sessionId} 的终端资源失败：`, error);
+  }
 }
 
 function markSessionDisconnected(sessionId: string, reason?: string) {
@@ -1199,24 +1209,25 @@ async function closeSession(sessionId = activeSessionId.value) {
   if (!sessionId) return;
   const session = sessions.value.find((item) => item.id === sessionId);
   if (!session) return;
-  const runtime = terminalRuntimes.get(sessionId);
-  runtime?.flushInput();
-  const pendingWrites = runtime?.writeQueue;
-  sessionStates[sessionId] = "disconnected";
-  if (session.kind === "local" || sessions.value.filter((item) => item.profile.id === session.profile.id).length === 1) {
-    connectionStates[session.profile.id] = "disconnected";
-  }
-  if (hostTrustRequest.value?.sessionId === sessionId) cancelHostTrust();
-  destroyTerminal(sessionId);
-  pendingPasswords.delete(sessionId);
-  sshPasswords.delete(sessionId);
-  delete sessionStates[sessionId];
-  sftpOpen.value = false;
   const index = sessions.value.findIndex((item) => item.id === sessionId);
   sessions.value = sessions.value.filter((item) => item.id !== sessionId);
   if (activeSessionId.value === sessionId) {
     activeSessionId.value = sessions.value[Math.max(0, index - 1)]?.id || sessions.value[0]?.id || null;
   }
+
+  const runtime = terminalRuntimes.get(sessionId);
+  runtime?.flushInput();
+  const pendingWrites = runtime?.writeQueue;
+  sessionStates[sessionId] = "disconnected";
+  if (session.kind === "local" || !sessions.value.some((item) => item.profile.id === session.profile.id)) {
+    connectionStates[session.profile.id] = "disconnected";
+  }
+  if (hostTrustRequest.value?.sessionId === sessionId) cancelHostTrust();
+  pendingPasswords.delete(sessionId);
+  sshPasswords.delete(sessionId);
+  delete sessionStates[sessionId];
+  sftpOpen.value = false;
+  destroyTerminal(sessionId);
   const command = session.kind === "local" ? "local_stop" : "ssh_disconnect";
   await pendingWrites;
   await invoke(command, { sessionId }).catch((error: unknown) => {
@@ -1329,8 +1340,13 @@ onUnmounted(() => {
         <div v-if="sessionsOpen" class="modal-backdrop menu-backdrop" @click.self="closeMenuPanels">
           <section class="sessions-popover menu-dialog" role="dialog" aria-modal="true" aria-labelledby="sessions-title" @click.stop>
             <div id="sessions-title" class="sessions-popover-heading"><span>会话列表</span><button type="button" @click="openNewProfile"><Plus :size="14" /> 添加主机</button></div>
-            <button class="saved-session local-session-button" type="button" :class="{ active: activeSession?.kind === 'local' }" @click="startLocalSessionFromMenu">
-              <TerminalSquare :size="15" /><span class="saved-session-copy"><strong>本机</strong></span><span class="status-dot" :class="activeSession?.kind === 'local' ? activeState : 'disconnected'"></span>
+            <button class="local-session-button" type="button" title="新建本机终端" aria-label="新建本机终端，在新标签页打开这台设备的 Shell" @click="startLocalSessionFromMenu">
+              <span class="local-session-icon"><TerminalSquare :size="19" /></span>
+              <span class="local-session-copy">
+                <strong>本机终端</strong>
+                <small>在新标签页打开这台设备的 Shell</small>
+              </span>
+              <span class="local-session-cta">新建 <ArrowRight :size="14" /></span>
             </button>
             <div class="sessions-divider"></div>
             <label class="search-box session-search">
@@ -1369,6 +1385,7 @@ onUnmounted(() => {
             <div v-if="windowMenuOpen" class="window-menu-dropdown" @click.stop>
               <button type="button" @click="handleMenuAction('open-settings')"><Settings2 :size="14" />外观</button>
               <button type="button" @click="handleMenuAction('manage-sessions')"><Server :size="14" />会话列表</button>
+              <button type="button" @click="handleMenuAction('open-local-terminal')"><TerminalSquare :size="14" />本机终端</button>
               <button type="button" @click="handleMenuAction('add-session')"><Plus :size="14" />添加 SSH 主机</button>
               <button type="button" @click="handleMenuAction('open-sftp')"><Folder :size="14" />SFTP 文件</button>
               <button type="button" @click="handleMenuAction('open-about')"><TerminalSquare :size="14" />关于 Apex Term</button>
@@ -1561,6 +1578,16 @@ button { cursor: pointer; }
 .sessions-popover,.settings-popover { position:fixed; z-index:8; top:12px; left:12px; right:auto; pointer-events:auto; border:1px solid var(--border); border-radius:8px; color:var(--text); background:var(--sidebar); box-shadow:0 12px 34px #0006; }
 .sessions-popover { width:320px; max-height:calc(100vh - 24px); display:flex; flex-direction:column; padding:9px; }
 .sessions-popover-heading { display:flex; align-items:center; justify-content:space-between; padding:5px 5px 9px; font-size:11px; font-weight:600; }.sessions-popover-heading button { display:inline-flex; align-items:center; gap:4px; padding:5px 8px; border:1px solid var(--border); border-radius:5px; color:var(--accent); background:var(--surface); font-size:10px; }.saved-session-list { min-height:0; max-height:min(260px, calc(100vh - 230px)); flex:0 1 260px; overflow-y:auto; overscroll-behavior:contain; }.saved-session-row { display:flex; align-items:center; border-radius:5px; }.saved-session-row:hover,.saved-session.active { background:var(--surface-muted); }.saved-session { min-width:0; min-height:44px; flex:1; display:flex; align-items:center; gap:10px; padding:5px 8px; border:0; color:var(--text-soft); text-align:left; background:transparent; }.saved-session-copy { min-width:0; flex:1; display:flex; flex-direction:column; gap:3px; }.saved-session-copy strong,.saved-session-copy small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.saved-session-copy strong { color:var(--text); font-size:10px; font-weight:500; }.saved-session-copy small { color:var(--text-faint); font-family:"IBM Plex Mono",monospace; font-size:9px; }.saved-session-delete { width:29px; height:29px; display:grid; place-items:center; border:0; border-radius:4px; color:var(--text-faint); background:transparent; }.saved-session-delete:hover { color:#bd5e54; background:#bd5e5415; }.sessions-divider { height:1px; margin:5px 0; background:var(--border); }.session-search { height:31px; margin:0 0 6px; }.sessions-empty { padding:20px 8px; color:var(--text-faint); text-align:center; font-size:10px; }.sessions-footnote { padding:8px 5px 2px; border-top:1px solid var(--border); color:var(--text-faint); font-size:9px; }
+.local-session-button { width:100%; min-height:68px; flex:0 0 auto; display:flex; align-items:center; gap:11px; margin:2px 0 5px; padding:9px 10px; border:1px solid var(--accent); border-radius:8px; color:var(--text); text-align:left; background:linear-gradient(135deg,var(--surface),var(--surface-muted)); box-shadow:inset 0 1px #ffffff0a,0 4px 12px #0003; font-family:inherit; cursor:pointer; transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease; }
+.local-session-button:hover { transform:translateY(-1px); border-color:var(--accent-bright); background:linear-gradient(135deg,var(--surface-muted),var(--surface)); box-shadow:inset 0 1px #ffffff12,0 7px 17px #0004; }
+.local-session-button:active { transform:translateY(0) scale(.99); }
+.local-session-button:focus-visible { outline:2px solid var(--accent-bright); outline-offset:2px; }
+.local-session-icon { width:38px; height:38px; flex:0 0 38px; display:grid; place-items:center; border:1px solid var(--border); border-radius:9px; color:var(--accent-bright); background:var(--surface-muted); }
+.local-session-copy { min-width:0; flex:1; display:flex; flex-direction:column; gap:4px; }
+.local-session-copy strong { color:var(--text); font-size:11px; font-weight:600; }
+.local-session-copy small { color:var(--text-soft); font-size:9px; line-height:1.4; }
+.local-session-cta { display:flex; align-items:center; gap:4px; padding:6px 7px; border:1px solid var(--border); border-radius:6px; color:var(--accent-bright); background:var(--surface-muted); font-size:9px; font-weight:600; white-space:nowrap; transition:color .15s ease,border-color .15s ease,background .15s ease; }
+.local-session-button:hover .local-session-cta { border-color:var(--accent); color:var(--text); background:var(--surface); }
 .settings-popover { width:218px; padding:14px; }
 .settings-title { margin-bottom:12px; color:var(--text); font-size:12px; font-weight:600; }.settings-select { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:9px; color:var(--text-soft); font-size:10px; }.settings-select select { width:132px; height:30px; padding:0 7px; border:1px solid var(--border); border-radius:5px; outline:none; color:var(--text); background:var(--surface); font-size:10px; }
 .app-body { flex:1; min-height:0; display:grid; grid-template-columns:minmax(0,1fr); }.eyebrow { color:#9aa29b; font-family:"IBM Plex Mono",monospace; font-size:9px; font-weight:500; letter-spacing:1px; }.add-button { width:30px; height:30px; display:grid; place-items:center; color:#f5f8f3; background:#52725b; border:0; border-radius:7px; }.add-button:hover,.primary-button:hover { background:#46644e; }
@@ -1640,9 +1667,6 @@ button { cursor: pointer; }
 .sftp-empty,.sftp-footer { color:#a0a0a0; }
 .sftp-footer { border-color:#292929; }
 .sftp-error { color:#ffaaa3; border-color:#5d302d; background:#271614; }
-.local-session-button { min-height:56px; gap:13px; padding:9px 12px; }
-.local-session-button > svg { width:19px; height:19px; flex:0 0 19px; }
-.local-session-button .saved-session-copy strong { font-size:12px; }
 .test-status { margin:-4px 0 0; color:#75e89e; font-size:10px; }
 .fingerprint-confirm { display:flex; flex-direction:column; gap:8px; padding:10px; border:1px solid #66572e; border-radius:6px; color:#e6d39a; background:#211c10; font-size:10px; overflow-wrap:anywhere; }
 .fingerprint-confirm code { color:#f0dfa7; font-family:"IBM Plex Mono",monospace; }
@@ -1954,7 +1978,7 @@ button { cursor: pointer; }
 }
 .app-shell .danger-button:hover:not(:disabled) { background:#a6443e; }
 @media (prefers-reduced-motion: reduce) {
-  .session-tab,.new-tab-button,.app-titlebar .new-tab-button { transition:none; }
+  .session-tab,.new-tab-button,.app-titlebar .new-tab-button,.local-session-button,.local-session-cta { transition:none; }
 }
 .app-shell.appearance-light .session-strip,.app-shell.appearance-light .app-titlebar {
   border-color:var(--border);
