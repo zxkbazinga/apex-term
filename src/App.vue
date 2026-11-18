@@ -5,7 +5,6 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
 import type { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
@@ -23,7 +22,9 @@ type TerminalSession = { id: string; kind: SessionKind; profile: HostProfile };
 type ThemeName = "graphite" | "midnight" | "paper" | "homebrew" | "dracula" | "nord" | "solarized" | "monokai" | "macos-glass";
 type AppearanceMode = "light" | "dark" | "system";
 type UpdateStatus = "idle" | "checking" | "current" | "available" | "error";
-type LatestRelease = { version: string; url: string };
+type ReleaseAsset = { name: string; url: string };
+type LatestRelease = { version: string; assets: ReleaseAsset[] };
+type UpdateDownloadProgress = { downloaded_bytes: number; total_bytes: number | null };
 type SftpEntry = { name: string; path: string; isDir: boolean; size: number | null; modified: number | null };
 type TerminalRuntime = {
   terminal: Terminal;
@@ -106,6 +107,9 @@ const aboutOpen = ref(false);
 const updateStatus = ref<UpdateStatus>("idle");
 const latestRelease = ref<LatestRelease | null>(null);
 const updateError = ref("");
+const updateDownloadStatus = ref<"idle" | "downloading" | "complete">("idle");
+const updateDownloadProgress = ref(0);
+const downloadedUpdatePath = ref("");
 const updateToastVisible = ref(false);
 const hostTrustRequest = ref<{ sessionId: string; profile: HostProfile; password: string; fingerprint: string; knownFingerprint?: string } | null>(null);
 const sftpOpen = ref(false);
@@ -243,6 +247,9 @@ async function checkForUpdates() {
   updateStatus.value = "checking";
   latestRelease.value = null;
   updateError.value = "";
+  updateDownloadStatus.value = "idle";
+  updateDownloadProgress.value = 0;
+  downloadedUpdatePath.value = "";
   try {
     const response = await fetch(LATEST_RELEASE_URL, {
       headers: {
@@ -260,16 +267,22 @@ async function checkForUpdates() {
     if (!response.ok) throw new Error(`GitHub API 返回 HTTP ${response.status}。`);
 
     const payload: unknown = await response.json();
-    if (!isRecord(payload) || typeof payload.tag_name !== "string" || typeof payload.html_url !== "string") {
+    if (!isRecord(payload) || typeof payload.tag_name !== "string" || !Array.isArray(payload.assets)) {
       throw new Error("GitHub 返回的版本信息格式无效。");
     }
     const releaseVersion = parseVersion(payload.tag_name);
     if (!releaseVersion) throw new Error(`无法识别版本号：${payload.tag_name}`);
-    const releaseUrl = new URL(payload.html_url);
-    if (releaseUrl.origin !== "https://github.com" || !releaseUrl.pathname.startsWith("/zxkbazinga/apex-term/releases/tag/")) {
-      throw new Error("GitHub 返回的发布页面地址无效。");
-    }
-    latestRelease.value = { version: payload.tag_name, url: releaseUrl.toString() };
+    const assets = payload.assets.map((asset): ReleaseAsset => {
+      if (!isRecord(asset) || typeof asset.name !== "string" || typeof asset.browser_download_url !== "string") {
+        throw new Error("GitHub 返回的安装包信息格式无效。");
+      }
+      const assetUrl = new URL(asset.browser_download_url);
+      if (assetUrl.origin !== "https://github.com" || !assetUrl.pathname.startsWith("/zxkbazinga/apex-term/releases/download/")) {
+        throw new Error("GitHub 返回的安装包地址无效。");
+      }
+      return { name: asset.name, url: assetUrl.toString() };
+    });
+    latestRelease.value = { version: payload.tag_name, assets };
     const comparison = compareVersions(payload.tag_name, APP_VERSION);
     if (comparison === null) throw new Error(`无法比较当前版本号：${APP_VERSION}`);
     updateStatus.value = comparison > 0 ? "available" : "current";
@@ -277,6 +290,53 @@ async function checkForUpdates() {
     updateStatus.value = "error";
     updateError.value = `检查更新失败：${error instanceof Error ? error.message : String(error)}`;
     console.error(updateError.value, error);
+  }
+}
+function getPlatformReleaseAsset(release: LatestRelease) {
+  const assets = release.assets;
+  if (isMacOS) return assets.find((asset) => asset.name.toLowerCase().endsWith(".dmg"));
+  if (isWindowsOS) {
+    return assets.find((asset) => asset.name.toLowerCase().endsWith(".msi"))
+      || assets.find((asset) => asset.name.toLowerCase().endsWith(".exe"));
+  }
+  return assets.find((asset) => asset.name.toLowerCase().endsWith(".appimage"))
+    || assets.find((asset) => /\.(deb|rpm)$/i.test(asset.name));
+}
+async function downloadLatestRelease() {
+  const release = latestRelease.value;
+  if (!release || updateDownloadStatus.value === "downloading") return;
+  if (!runtimeAvailable.value) {
+    updateError.value = "应用内下载需要在 ApexTerm 桌面版中运行。";
+    return;
+  }
+  const asset = getPlatformReleaseAsset(release);
+  if (!asset) {
+    updateError.value = "没有找到适用于当前系统的安装包。";
+    return;
+  }
+  updateError.value = "";
+  updateDownloadStatus.value = "downloading";
+  updateDownloadProgress.value = 0;
+  downloadedUpdatePath.value = "";
+  let unlisten: (() => void) | undefined;
+  try {
+    unlisten = await listen<UpdateDownloadProgress>("update-download-progress", ({ payload }) => {
+      if (payload.total_bytes && payload.total_bytes > 0) {
+        updateDownloadProgress.value = Math.min(100, Math.floor(payload.downloaded_bytes / payload.total_bytes * 100));
+      }
+    });
+    downloadedUpdatePath.value = await invoke<string>("download_update", {
+      url: asset.url,
+      fileName: asset.name,
+    });
+    updateDownloadProgress.value = 100;
+    updateDownloadStatus.value = "complete";
+  } catch (error) {
+    updateDownloadStatus.value = "idle";
+    updateError.value = `下载更新失败：${error instanceof Error ? error.message : String(error)}`;
+    console.error(updateError.value, error);
+  } finally {
+    unlisten?.();
   }
 }
 async function checkForUpdatesAutomatically() {
@@ -304,21 +364,6 @@ function dismissUpdateToast() {
 function openUpdateDetails() {
   dismissUpdateToast();
   aboutOpen.value = true;
-}
-async function openLatestRelease() {
-  const release = latestRelease.value;
-  if (!release) return;
-  try {
-    if (runtimeAvailable.value) {
-      await openUrl(release.url);
-    } else {
-      const openedWindow = window.open(release.url, "_blank", "noopener,noreferrer");
-      if (!openedWindow) throw new Error("浏览器阻止了打开发布页面。");
-    }
-  } catch (error) {
-    updateError.value = `打开下载页面失败：${error instanceof Error ? error.message : String(error)}`;
-    console.error(updateError.value, error);
-  }
 }
 function setWallpaperTransparency(value: number) {
   wallpaperTransparency.value = value;
@@ -1416,14 +1461,30 @@ onUnmounted(() => {
         <p class="about-description">一款简洁的桌面终端与 SSH 会话管理工具。</p>
         <p class="about-author">作者：{{ APP_AUTHOR }}</p>
         <div class="about-update">
-          <button class="secondary-button" type="button" :disabled="updateStatus === 'checking'" @click="checkForUpdates">
-            <RefreshCw :size="14" :class="{ spin: updateStatus === 'checking' }" />
-            {{ updateStatus === "checking" ? "检查中…" : "检查更新" }}
+          <button class="secondary-button" type="button" :disabled="updateStatus === 'checking' || updateDownloadStatus === 'downloading'" @click="checkForUpdates">
+            <RefreshCw :size="14" :class="{ spin: updateStatus === 'checking' || updateDownloadStatus === 'downloading' }" />
+            {{ updateStatus === "checking" ? "检查中…" : updateDownloadStatus === "downloading" ? "下载中…" : "检查更新" }}
           </button>
           <p v-if="updateStatus === 'current'" class="update-message" role="status">当前已是最新版本（{{ APP_VERSION }}）。</p>
           <p v-if="updateStatus === 'available' && latestRelease" class="update-message" role="status">发现新版本 {{ latestRelease.version }}。</p>
+          <p v-if="updateDownloadStatus === 'downloading'" class="update-message" role="status">
+            正在下载更新包<span v-if="updateDownloadProgress > 0">：{{ updateDownloadProgress }}%</span>
+          </p>
+          <p v-if="updateDownloadStatus === 'complete'" class="update-message update-download-path" role="status">
+            更新包已下载到：{{ downloadedUpdatePath }}
+          </p>
           <p v-if="updateError" class="update-error" role="alert">{{ updateError }}</p>
-          <button v-if="updateStatus === 'available'" class="primary-button" type="button" @click="openLatestRelease"><Download :size="14" /> 前往 GitHub 下载</button>
+          <button
+            v-if="updateStatus === 'available' && runtimeAvailable"
+            class="primary-button"
+            type="button"
+            :disabled="updateDownloadStatus === 'downloading' || updateDownloadStatus === 'complete'"
+            @click="downloadLatestRelease"
+          >
+            <Download :size="14" />
+            {{ updateDownloadStatus === "complete" ? "已下载" : updateDownloadStatus === "downloading" ? "下载中…" : "下载更新包" }}
+          </button>
+          <p v-if="updateStatus === 'available' && !runtimeAvailable" class="update-message">请在 ApexTerm 桌面版中下载更新包。</p>
         </div>
         <div class="about-credits">Built with Tauri · Vue · Rust</div>
         <button class="secondary-button about-close" type="button" @click="aboutOpen = false">关闭</button>
