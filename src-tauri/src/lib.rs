@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,10 +12,10 @@ use keyring::Entry;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use socket2::{SockRef, TcpKeepalive};
-use ssh2::Channel;
+use ssh2::{Channel, OpenFlags, OpenType};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-const MAX_SFTP_FILE_SIZE: usize = 32 * 1024 * 1024;
+const SFTP_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_UPDATE_DOWNLOAD_SIZE: u64 = 1024 * 1024 * 1024;
 const CREDENTIAL_SERVICE: &str = "com.zzbazinga.apex-term";
 
@@ -249,6 +249,33 @@ fn credential_delete(profile_id: String) -> Result<(), String> {
 #[derive(Default)]
 struct SshSessions(Arc<Mutex<HashMap<String, Arc<Mutex<Channel>>>>>);
 
+struct SftpSession {
+    _session: ssh2::Session,
+    sftp: ssh2::Sftp,
+}
+
+/// 建立 SFTP 所需的认证参数，在 SSH 连接成功时保存；
+/// 真正建立 SFTP 连接推迟到首次使用文件管理时（按需建立）。
+struct SftpConnectionParams {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    trusted_fingerprint: Option<String>,
+    auth_method: String,
+    private_key: Option<String>,
+    passphrase: Option<String>,
+}
+
+/// 每个 SSH 会话对应一份 SFTP 状态：参数 + 惰性建立的连接。
+struct SftpSessionState {
+    params: SftpConnectionParams,
+    session: Option<Arc<Mutex<SftpSession>>>,
+}
+
+#[derive(Default)]
+struct SftpSessions(Arc<Mutex<HashMap<String, Arc<Mutex<SftpSessionState>>>>>);
+
 struct LocalSession {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -467,12 +494,27 @@ fn local_stop(sessions: State<'_, LocalSessions>, session_id: String) -> Result<
     Ok(())
 }
 
-fn resolve_address(host: &str, port: u16) -> Result<SocketAddr, String> {
-    (host, port)
+fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+    let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|error| format!("无法解析主机地址：{error}"))?
-        .next()
-        .ok_or_else(|| "没有找到可用的主机地址".to_string())
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("没有找到可用的主机地址".to_string());
+    }
+    let mut last_error: Option<std::io::Error> = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "连接失败：{}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "没有可用的主机地址".to_string())
+    ))
 }
 
 fn connect_authenticated_ssh(
@@ -481,10 +523,11 @@ fn connect_authenticated_ssh(
     username: &str,
     password: &str,
     trusted_fingerprint: Option<&str>,
+    auth_method: &str,
+    private_key: Option<&str>,
+    passphrase: Option<&str>,
 ) -> Result<(ssh2::Session, TcpStream), String> {
-    let address = resolve_address(host, port)?;
-    let socket = TcpStream::connect_timeout(&address, Duration::from_secs(10))
-        .map_err(|error| format!("连接失败：{error}"))?;
+    let socket = connect_tcp(host, port)?;
     SockRef::from(&socket)
         .set_tcp_keepalive(
             &TcpKeepalive::new()
@@ -554,11 +597,19 @@ fn connect_authenticated_ssh(
         Some(_) => return Err(format!("HOST_KEY_CHANGED:{fingerprint}")),
         None => return Err(format!("HOST_KEY_CONFIRM:{fingerprint}")),
     }
-    session
-        .userauth_password(username, password)
-        .map_err(|error| format!("SSH 认证失败：{error}"))?;
+    if auth_method == "privateKey" {
+        let key = private_key.ok_or_else(|| "未提供私钥内容".to_string())?;
+        let pass = passphrase.filter(|value| !value.is_empty());
+        session
+            .userauth_pubkey_memory(username, None, key, pass)
+            .map_err(|error| format!("SSH 私钥认证失败：{error}。请确认私钥格式正确，若为加密私钥请填写口令。"))?;
+    } else {
+        session
+            .userauth_password(username, password)
+            .map_err(|error| format!("SSH 密码认证失败：{error}"))?;
+    }
     if !session.authenticated() {
-        return Err("SSH 认证失败，请检查用户名和密码".to_string());
+        return Err("SSH 认证失败，请检查用户名和凭据".to_string());
     }
     timeout_reset_socket
         .set_read_timeout(None)
@@ -615,39 +666,53 @@ fn resize_channel(channel: &mut Channel, cols: u32, rows: u32) -> Result<(), Str
     }
 }
 
-fn with_sftp<T>(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    trusted_fingerprint: Option<&str>,
-    operation: impl FnOnce(&ssh2::Sftp) -> Result<T, String>,
-) -> Result<T, String> {
-    let (session, _) =
-        connect_authenticated_ssh(host, port, username, password, trusted_fingerprint)?;
+type SftpSessionMap = Arc<Mutex<HashMap<String, Arc<Mutex<SftpSessionState>>>>>;
+
+fn establish_sftp(params: &SftpConnectionParams) -> Result<SftpSession, String> {
+    let (session, _) = connect_authenticated_ssh(
+        &params.host,
+        params.port,
+        &params.username,
+        &params.password,
+        params.trusted_fingerprint.as_deref(),
+        &params.auth_method,
+        params.private_key.as_deref(),
+        params.passphrase.as_deref(),
+    )?;
     let sftp = session
         .sftp()
         .map_err(|error| format!("无法启动 SFTP 子系统：{error}"))?;
-    operation(&sftp)
+    Ok(SftpSession {
+        _session: session,
+        sftp,
+    })
 }
 
-async fn run_sftp<T: Send + 'static>(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    trusted_fingerprint: Option<String>,
+async fn run_cached_sftp<T: Send + 'static>(
+    sessions: SftpSessionMap,
+    session_id: String,
     operation: impl FnOnce(&ssh2::Sftp) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        with_sftp(
-            &host,
-            port,
-            &username,
-            &password,
-            trusted_fingerprint.as_deref(),
-            operation,
-        )
+        let state = sessions
+            .lock()
+            .map_err(|_| "SFTP 会话状态异常".to_string())?
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                "当前 SSH 会话不支持 SFTP，或连接已断开。请确认服务器已开启 SFTP 子系统。"
+                    .to_string()
+            })?;
+
+        let mut state = state.lock().map_err(|_| "SFTP 会话状态异常".to_string())?;
+        if state.session.is_none() {
+            state.session = Some(Arc::new(Mutex::new(establish_sftp(&state.params)?)));
+        }
+        let handle = state.session.as_ref().unwrap().clone();
+        drop(state);
+
+        let guard = handle.lock().map_err(|_| "SFTP 会话状态异常".to_string())?;
+        operation(&guard.sftp)
     })
     .await
     .map_err(|error| format!("SFTP 任务失败：{error}"))?
@@ -672,19 +737,13 @@ struct SftpListing {
 
 #[tauri::command]
 async fn sftp_list(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    trusted_fingerprint: Option<String>,
+    sessions: State<'_, SftpSessions>,
+    session_id: String,
     path: String,
 ) -> Result<SftpListing, String> {
-    run_sftp(
-        host,
-        port,
-        username,
-        password,
-        trusted_fingerprint,
+    run_cached_sftp(
+        sessions.0.clone(),
+        session_id,
         move |sftp| {
             let directory = sftp
                 .realpath(Path::new(&path))
@@ -729,28 +788,29 @@ async fn sftp_list(
     .await
 }
 
+/// 分块上传：`create` 为首块（新建并截断文件、做覆盖检查），后续块以写模式打开并 seek 到 offset。
+/// 每块独立开/关文件句柄，前端逐块读取文件，因此内存占用恒定，不再有 32 MB 上限。
 #[tauri::command]
-async fn sftp_upload(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    trusted_fingerprint: Option<String>,
+async fn sftp_upload_chunk(
+    sessions: State<'_, SftpSessions>,
+    session_id: String,
     path: String,
+    offset: u64,
     data: Vec<u8>,
     overwrite: bool,
+    create: bool,
 ) -> Result<(), String> {
-    if data.len() > MAX_SFTP_FILE_SIZE {
-        return Err("单个文件最大支持 32 MB".to_string());
+    if data.len() > SFTP_CHUNK_SIZE {
+        return Err(format!(
+            "单个数据块不能超过 {} MB",
+            SFTP_CHUNK_SIZE / 1024 / 1024
+        ));
     }
-    run_sftp(
-        host,
-        port,
-        username,
-        password,
-        trusted_fingerprint,
+    run_cached_sftp(
+        sessions.0.clone(),
+        session_id,
         move |sftp| {
-            if !overwrite {
+            if create && !overwrite {
                 match sftp.stat(Path::new(&path)) {
                     Ok(_) => return Err("远程文件已存在，请确认覆盖后重试".to_string()),
                     Err(error)
@@ -761,22 +821,32 @@ async fn sftp_upload(
                     Err(error) => return Err(format!("检查远程文件失败：{error}")),
                 }
             }
-            let mut file = sftp
-                .create(Path::new(&path))
-                .map_err(|error| {
-                    if error.code() == ssh2::ErrorCode::SFTP(3) {
-                        format!(
-                            "没有权限在远程路径“{path}”创建文件。请切换到 SSH 用户有写入权限的目录（例如其 home 目录），或调整 Ubuntu 目录的所有者/权限。"
-                        )
-                    } else {
-                        format!("创建远程文件失败：{error}")
-                    }
-                })?;
+            let mut file = if create {
+                sftp.create(Path::new(&path))
+            } else {
+                sftp.open_mode(
+                    Path::new(&path),
+                    OpenFlags::WRITE,
+                    0o644,
+                    OpenType::File,
+                )
+            }
+            .map_err(|error| {
+                if error.code() == ssh2::ErrorCode::SFTP(3) {
+                    format!(
+                        "没有权限在远程路径“{path}”创建文件。请切换到 SSH 用户有写入权限的目录（例如其 home 目录），或调整目录的所有者/权限。"
+                    )
+                } else {
+                    format!("打开远程文件失败：{error}")
+                }
+            })?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| format!("定位远程文件失败：{error}"))?;
             file.write_all(&data)
                 .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::PermissionDenied {
                         format!(
-                            "没有权限向远程路径“{path}”写入文件。请切换到 SSH 用户有写入权限的目录（例如其 home 目录），或调整 Ubuntu 目录的所有者/权限。"
+                            "没有权限向远程路径“{path}”写入文件。请切换到 SSH 用户有写入权限的目录（例如其 home 目录），或调整目录的所有者/权限。"
                         )
                     } else {
                         format!("上传文件失败：{error}")
@@ -787,33 +857,29 @@ async fn sftp_upload(
     .await
 }
 
+/// 分块下载：按 offset 读取一块（最多 1 MB），前端逐块拼接成 Blob。
+/// 每次只把一块经 IPC 传回，内存占用恒定，不再有 32 MB 上限。
 #[tauri::command]
-async fn sftp_download(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    trusted_fingerprint: Option<String>,
+async fn sftp_download_chunk(
+    sessions: State<'_, SftpSessions>,
+    session_id: String,
     path: String,
+    offset: u64,
 ) -> Result<Vec<u8>, String> {
-    run_sftp(
-        host,
-        port,
-        username,
-        password,
-        trusted_fingerprint,
+    run_cached_sftp(
+        sessions.0.clone(),
+        session_id,
         move |sftp| {
             let mut file = sftp
                 .open(Path::new(&path))
                 .map_err(|error| format!("打开远程文件失败：{error}"))?;
-            let mut data = Vec::new();
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|error| format!("定位远程文件失败：{error}"))?;
+            let mut data = Vec::with_capacity(SFTP_CHUNK_SIZE);
             Read::by_ref(&mut file)
-                .take((MAX_SFTP_FILE_SIZE + 1) as u64)
+                .take(SFTP_CHUNK_SIZE as u64)
                 .read_to_end(&mut data)
                 .map_err(|error| format!("下载文件失败：{error}"))?;
-            if data.len() > MAX_SFTP_FILE_SIZE {
-                return Err("单个文件最大支持 32 MB".to_string());
-            }
             Ok(data)
         },
     )
@@ -822,19 +888,13 @@ async fn sftp_download(
 
 #[tauri::command]
 async fn sftp_mkdir(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    trusted_fingerprint: Option<String>,
+    sessions: State<'_, SftpSessions>,
+    session_id: String,
     path: String,
 ) -> Result<(), String> {
-    run_sftp(
-        host,
-        port,
-        username,
-        password,
-        trusted_fingerprint,
+    run_cached_sftp(
+        sessions.0.clone(),
+        session_id,
         move |sftp| {
             sftp.mkdir(Path::new(&path), 0o755)
                 .map_err(|error| format!("创建远程目录失败：{error}"))
@@ -845,19 +905,13 @@ async fn sftp_mkdir(
 
 #[tauri::command]
 async fn sftp_delete(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    trusted_fingerprint: Option<String>,
+    sessions: State<'_, SftpSessions>,
+    session_id: String,
     path: String,
 ) -> Result<(), String> {
-    run_sftp(
-        host,
-        port,
-        username,
-        password,
-        trusted_fingerprint,
+    run_cached_sftp(
+        sessions.0.clone(),
+        session_id,
         move |sftp| {
             let stat = sftp
                 .stat(Path::new(&path))
@@ -878,16 +932,22 @@ async fn sftp_delete(
 async fn ssh_connect(
     app: AppHandle,
     sessions: State<'_, SshSessions>,
+    sftp_sessions: State<'_, SftpSessions>,
     session_id: String,
     host: String,
     port: u16,
     username: String,
     password: String,
     trusted_fingerprint: Option<String>,
+    auth_method: Option<String>,
+    private_key: Option<String>,
+    passphrase: Option<String>,
     cols: u32,
     rows: u32,
 ) -> Result<(), String> {
     let sessions = sessions.0.clone();
+    let sftp_sessions = sftp_sessions.0.clone();
+    let auth_method_value = auth_method.unwrap_or_else(|| "password".to_string());
     tauri::async_runtime::spawn_blocking(move || {
         let (session, socket) = connect_authenticated_ssh(
             &host,
@@ -895,6 +955,9 @@ async fn ssh_connect(
             &username,
             &password,
             trusted_fingerprint.as_deref(),
+            &auth_method_value,
+            private_key.as_deref(),
+            passphrase.as_deref(),
         )?;
 
         let mut channel = session
@@ -920,7 +983,32 @@ async fn ssh_connect(
             .map_err(|_| "SSH 会话状态异常".to_string())?
             .insert(session_id.clone(), channel.clone());
 
+        // 只保存建立 SFTP 所需的认证参数，不在这里真正建立连接。
+        // 真正连接推迟到用户打开 SFTP 面板时（见 run_cached_sftp），这样：
+        //   1) 不支持 SFTP 子系统的服务器（如群晖 NAS）仍能正常使用 SSH 终端；
+        //   2) SSH 连接不再额外多做一次完整的 TCP + 认证握手；
+        //   3) SFTP 失败只在文件面板内提示，不再污染终端输出。
+        if let Ok(mut map) = sftp_sessions.lock() {
+            map.insert(
+                session_id.clone(),
+                Arc::new(Mutex::new(SftpSessionState {
+                    params: SftpConnectionParams {
+                        host,
+                        port,
+                        username,
+                        password,
+                        trusted_fingerprint,
+                        auth_method: auth_method_value,
+                        private_key,
+                        passphrase,
+                    },
+                    session: None,
+                })),
+            );
+        }
+
         let output_app = app.clone();
+        let sftp_sessions_cleanup = sftp_sessions.clone();
         thread::spawn(move || {
             let event_name = format!("ssh-output-{session_id}");
             let ended_event_name = format!("ssh-session-ended-{session_id}");
@@ -1032,6 +1120,9 @@ async fn ssh_connect(
                 false
             };
             if is_current {
+                if let Ok(mut map) = sftp_sessions_cleanup.lock() {
+                    map.remove(&session_id);
+                }
                 let _ = output_app.emit(&ended_event_name, end_reason);
             }
         });
@@ -1048,7 +1139,11 @@ async fn ssh_test_connection(
     username: String,
     password: String,
     trusted_fingerprint: Option<String>,
+    auth_method: Option<String>,
+    private_key: Option<String>,
+    passphrase: Option<String>,
 ) -> Result<(), String> {
+    let auth_method_value = auth_method.unwrap_or_else(|| "password".to_string());
     tauri::async_runtime::spawn_blocking(move || {
         let (session, _) = connect_authenticated_ssh(
             &host,
@@ -1056,6 +1151,9 @@ async fn ssh_test_connection(
             &username,
             &password,
             trusted_fingerprint.as_deref(),
+            &auth_method_value,
+            private_key.as_deref(),
+            passphrase.as_deref(),
         )?;
         session
             .disconnect(None, "connection test complete", None)
@@ -1103,7 +1201,11 @@ fn ssh_resize(
 }
 
 #[tauri::command]
-fn ssh_disconnect(sessions: State<'_, SshSessions>, session_id: String) -> Result<(), String> {
+fn ssh_disconnect(
+    sessions: State<'_, SshSessions>,
+    sftp_sessions: State<'_, SftpSessions>,
+    session_id: String,
+) -> Result<(), String> {
     let channel = sessions
         .0
         .lock()
@@ -1113,6 +1215,9 @@ fn ssh_disconnect(sessions: State<'_, SshSessions>, session_id: String) -> Resul
         let mut channel = channel.lock().map_err(|_| "SSH 终端状态异常".to_string())?;
         let _ = channel.close();
     }
+    if let Ok(mut map) = sftp_sessions.0.lock() {
+        map.remove(&session_id);
+    }
     Ok(())
 }
 
@@ -1121,6 +1226,7 @@ pub fn run() {
     tauri::Builder::default()
         .enable_macos_default_menu(false)
         .manage(SshSessions::default())
+        .manage(SftpSessions::default())
         .manage(LocalSessions::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1181,8 +1287,8 @@ pub fn run() {
             ssh_resize,
             ssh_disconnect,
             sftp_list,
-            sftp_upload,
-            sftp_download,
+            sftp_upload_chunk,
+            sftp_download_chunk,
             sftp_mkdir,
             sftp_delete
         ])
