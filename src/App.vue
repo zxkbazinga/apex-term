@@ -15,7 +15,8 @@ import {
 } from "lucide-vue-next";
 import "@xterm/xterm/css/xterm.css";
 
-type HostProfile = { id: string; name: string; host: string; port: number; username: string; fingerprint?: string };
+type AuthMethod = "password" | "privateKey";
+type HostProfile = { id: string; name: string; host: string; port: number; username: string; fingerprint?: string; authMethod?: AuthMethod };
 type SessionKind = "local" | "ssh";
 type ConnectionState = "connected" | "connecting" | "disconnected";
 type TerminalSession = { id: string; kind: SessionKind; profile: HostProfile };
@@ -42,7 +43,7 @@ type TerminalRuntime = {
 };
 const APP_VERSION = packageJson.version;
 const APP_AUTHOR = "Zzbazinga";
-const MAX_SFTP_FILE_SIZE = 32 * 1024 * 1024;
+const SFTP_CHUNK_SIZE = 1024 * 1024;
 const LATEST_RELEASE_URL = "https://api.github.com/repos/zxkbazinga/apex-term/releases/latest";
 const DISMISSED_UPDATE_VERSION_KEY = "apex-dismissed-update-version";
 
@@ -111,12 +112,14 @@ const updateDownloadStatus = ref<"idle" | "downloading" | "complete">("idle");
 const updateDownloadProgress = ref(0);
 const downloadedUpdatePath = ref("");
 const updateToastVisible = ref(false);
-const hostTrustRequest = ref<{ sessionId: string; profile: HostProfile; password: string; fingerprint: string; knownFingerprint?: string } | null>(null);
+type AuthInput = { authMethod: AuthMethod; password: string; privateKey: string; passphrase: string };
+const hostTrustRequest = ref<({ sessionId: string; profile: HostProfile; fingerprint: string; knownFingerprint?: string } & AuthInput) | null>(null);
 const sftpOpen = ref(false);
 const sftpPath = ref(".");
 const sftpEntries = ref<SftpEntry[]>([]);
 const sftpLoading = ref(false);
 const sftpError = ref("");
+const sftpTransfer = ref("");
 const uploadInput = ref<HTMLInputElement | null>(null);
 const editingProfileId = ref<string | null>(null);
 const profileToDelete = ref<HostProfile | null>(null);
@@ -129,13 +132,64 @@ const testLoading = ref(false);
 const testFingerprintToTrust = ref("");
 const profileFormFingerprint = ref<string | undefined>();
 const profileFingerprintEndpoint = ref<string | null>(null);
-const profileForm = reactive({ name: "", host: "", port: 22, username: "", password: "" });
+const profileForm = reactive<{
+  name: string; host: string; port: number; username: string;
+  authMethod: AuthMethod; password: string; privateKey: string; passphrase: string;
+}>({ name: "", host: "", port: 22, username: "", authMethod: "password", password: "", privateKey: "", passphrase: "" });
 
-const credentialCache = new Map<string, string>();
-const sshPasswords = new Map<string, string>();
+const credentialCache = new Map<string, AuthInput>();
+const sshCredentials = new Map<string, AuthInput>();
 const terminalElements = new Map<string, HTMLElement>();
 const terminalRuntimes = new Map<string, TerminalRuntime>();
-const pendingPasswords = new Map<string, string>();
+const pendingCredentials = new Map<string, AuthInput>();
+
+function currentAuthInput(): AuthInput {
+  return {
+    authMethod: profileForm.authMethod,
+    password: profileForm.password,
+    privateKey: profileForm.privateKey,
+    passphrase: profileForm.passphrase,
+  };
+}
+function credentialKeyFor(profileId: string, field: "privateKey" | "passphrase") {
+  return `${profileId}:${field}`;
+}
+async function readCredential(key: string): Promise<string> {
+  return (await invoke<string | null>("credential_get", { profileId: key })) || "";
+}
+async function loadCredential(profile: HostProfile): Promise<AuthInput | null> {
+  const cached = credentialCache.get(profile.id);
+  if (cached) return cached;
+  const method: AuthMethod = profile.authMethod || "password";
+  if (method === "privateKey") {
+    const privateKey = await readCredential(credentialKeyFor(profile.id, "privateKey"));
+    if (!privateKey) return null;
+    const passphrase = await readCredential(credentialKeyFor(profile.id, "passphrase"));
+    const input: AuthInput = { authMethod: "privateKey", password: "", privateKey, passphrase };
+    credentialCache.set(profile.id, input);
+    return input;
+  }
+  const password = await readCredential(profile.id);
+  if (!password) return null;
+  const input: AuthInput = { authMethod: "password", password, privateKey: "", passphrase: "" };
+  credentialCache.set(profile.id, input);
+  return input;
+}
+async function storeCredential(profile: HostProfile, input: AuthInput): Promise<void> {
+  if (input.authMethod === "privateKey") {
+    if (!input.privateKey.trim()) throw new Error("请输入私钥内容");
+    await invoke("credential_store", { profileId: credentialKeyFor(profile.id, "privateKey"), password: input.privateKey });
+    if (input.passphrase) {
+      await invoke("credential_store", { profileId: credentialKeyFor(profile.id, "passphrase"), password: input.passphrase });
+    } else {
+      await invoke("credential_delete", { profileId: credentialKeyFor(profile.id, "passphrase") });
+    }
+  } else {
+    if (!input.password) throw new Error("请输入 SSH 密码");
+    await invoke("credential_store", { profileId: profile.id, password: input.password });
+  }
+  credentialCache.set(profile.id, { ...input });
+}
 let resolveHostTrust: (() => void) | undefined;
 let rejectHostTrust: ((error: Error) => void) | undefined;
 let unlistenNativeMenu: (() => void) | undefined;
@@ -463,7 +517,7 @@ function openSessionsList() {
 function openNewProfile() {
   sessionsOpen.value = false;
   editingProfileId.value = null;
-  Object.assign(profileForm, { name: "", host: "", port: 22, username: "", password: "" });
+  Object.assign(profileForm, { name: "", host: "", port: 22, username: "", authMethod: "password", password: "", privateKey: "", passphrase: "" });
   formError.value = "";
   testError.value = "";
   testStatus.value = "";
@@ -475,7 +529,10 @@ function openNewProfile() {
 function openProfile(profile: HostProfile) {
   sessionsOpen.value = false;
   editingProfileId.value = profile.id;
-  Object.assign(profileForm, { name: profile.name, host: profile.host, port: profile.port, username: profile.username, password: "" });
+  Object.assign(profileForm, {
+    name: profile.name, host: profile.host, port: profile.port, username: profile.username,
+    authMethod: profile.authMethod || "password", password: "", privateKey: "", passphrase: "",
+  });
   formError.value = "";
   testError.value = "";
   testStatus.value = "";
@@ -496,8 +553,10 @@ async function confirmDeleteProfile() {
   if (runtimeAvailable.value) {
     try {
       await invoke("credential_delete", { profileId: profile.id });
+      await invoke("credential_delete", { profileId: credentialKeyFor(profile.id, "privateKey") });
+      await invoke("credential_delete", { profileId: credentialKeyFor(profile.id, "passphrase") });
     } catch (error) {
-      profileDeleteError.value = `无法删除保存的 SSH 密码：${String(error)}`;
+      profileDeleteError.value = `无法删除保存的 SSH 凭据：${String(error)}`;
       profileDeleteLoading.value = false;
       return;
     }
@@ -517,16 +576,15 @@ async function connectSavedProfile(profile: HostProfile) {
     return;
   }
   try {
-    const password = credentialCache.get(profile.id) || await invoke<string | null>("credential_get", { profileId: profile.id });
-    if (!password) {
+    const credential = await loadCredential(profile);
+    if (!credential) {
       openProfile(profile);
-      formError.value = "此会话尚未保存密码。输入密码并保存后，下次即可直接连接。";
+      formError.value = "此会话尚未保存凭据。输入凭据并保存后，下次即可直接连接。";
       return;
     }
-    credentialCache.set(profile.id, password);
-    await connectProfile(profile, password);
+    await connectProfile(profile, credential);
   } catch (error) {
-    window.alert(`读取保存的 SSH 密码失败：${String(error)}`);
+    window.alert(`读取保存的 SSH 凭据失败：${String(error)}`);
   }
 }
 
@@ -546,22 +604,32 @@ async function testConnection(trustFingerprint = currentProfileFingerprint()) {
     testError.value = "端口范围应为 1–65535。";
     return;
   }
-  let password = profileForm.password;
-  const profileId = editingProfileId.value;
-  if (!password && profileId) {
-    password = credentialCache.get(profileId) || "";
-    if (!password) {
+  let credential = currentAuthInput();
+  if (credential.authMethod === "password" && !credential.password && editingProfileId.value) {
+    const profileId = editingProfileId.value;
+    const cached = credentialCache.get(profileId);
+    if (cached?.authMethod === "password") {
+      credential = { ...cached };
+    } else {
       try {
-        password = await invoke<string | null>("credential_get", { profileId }) || "";
-        if (password) credentialCache.set(profileId, password);
+        const saved = await readCredential(profileId);
+        if (saved) credential = { authMethod: "password", password: saved, privateKey: "", passphrase: "" };
       } catch (error) {
         testError.value = `读取已保存密码失败：${String(error)}`;
         return;
       }
     }
   }
-  if (!password) {
+  if (credential.authMethod === "privateKey" && !credential.privateKey.trim() && editingProfileId.value) {
+    const saved = await loadCredential({ ...profileForm, id: editingProfileId.value, fingerprint: undefined } as HostProfile);
+    if (saved?.authMethod === "privateKey") credential = { ...saved };
+  }
+  if (credential.authMethod === "password" && !credential.password) {
     testError.value = "请先输入 SSH 密码。";
+    return;
+  }
+  if (credential.authMethod === "privateKey" && !credential.privateKey.trim()) {
+    testError.value = "请先粘贴私钥内容。";
     return;
   }
   testLoading.value = true;
@@ -570,8 +638,11 @@ async function testConnection(trustFingerprint = currentProfileFingerprint()) {
       host: profileForm.host.trim(),
       port: Number(profileForm.port),
       username: profileForm.username.trim(),
-      password,
+      password: credential.password,
       trustedFingerprint: trustFingerprint || null,
+      authMethod: credential.authMethod,
+      privateKey: credential.privateKey || null,
+      passphrase: credential.passphrase || null,
     });
     profileFormFingerprint.value = trustFingerprint;
     profileFingerprintEndpoint.value = profileEndpoint(profileForm.host, profileForm.port);
@@ -652,14 +723,17 @@ function startLocalSession() {
   activeSessionId.value = id;
 }
 
-async function establishSshSession(sessionId: string, profile: HostProfile, password: string, cols: number, rows: number) {
+async function establishSshSession(sessionId: string, profile: HostProfile, credential: AuthInput, cols: number, rows: number) {
   const connect = (trustedFingerprint: string | null) => invoke("ssh_connect", {
     sessionId,
     host: profile.host,
     port: profile.port,
     username: profile.username,
-    password,
+    password: credential.password,
     trustedFingerprint,
+    authMethod: credential.authMethod,
+    privateKey: credential.privateKey || null,
+    passphrase: credential.passphrase || null,
     cols,
     rows,
   });
@@ -671,7 +745,7 @@ async function establishSshSession(sessionId: string, profile: HostProfile, pass
     if (message.startsWith("HOST_KEY_CONFIRM:")) {
       const fingerprint = message.slice("HOST_KEY_CONFIRM:".length);
       await new Promise<void>((resolve, reject) => {
-        hostTrustRequest.value = { sessionId, profile, password, fingerprint };
+        hostTrustRequest.value = { sessionId, profile, ...credential, fingerprint };
         resolveHostTrust = resolve;
         rejectHostTrust = reject;
       });
@@ -681,7 +755,7 @@ async function establishSshSession(sessionId: string, profile: HostProfile, pass
         hostTrustRequest.value = {
           sessionId,
           profile,
-          password,
+          ...credential,
           fingerprint,
           knownFingerprint: profile.fingerprint,
         };
@@ -707,6 +781,9 @@ async function trustHostFingerprint() {
       username: request.profile.username,
       password: request.password,
       trustedFingerprint: request.fingerprint,
+      authMethod: request.authMethod,
+      privateKey: request.privateKey || null,
+      passphrase: request.passphrase || null,
       cols: runtime?.terminal.cols || 80,
       rows: runtime?.terminal.rows || 24,
     });
@@ -901,12 +978,12 @@ function createTerminal(session: TerminalSession, element: HTMLElement) {
     }
     runtime.outputUnlisten = unlistenOutput;
     runtime.connectionEndedUnlisten = unlistenEnded;
-    const password = pendingPasswords.get(session.id) || "";
-    pendingPasswords.delete(session.id);
+    const credential = pendingCredentials.get(session.id) || { authMethod: "password" as AuthMethod, password: "", privateKey: "", passphrase: "" };
+    pendingCredentials.delete(session.id);
     runtime.lastPtySize = { cols: terminal.cols || 80, rows: terminal.rows || 24 };
     const start = session.kind === "local"
       ? invoke("local_start", { sessionId: session.id, cols: terminal.cols || 80, rows: terminal.rows || 24 })
-      : establishSshSession(session.id, session.profile, password, terminal.cols || 80, terminal.rows || 24);
+      : establishSshSession(session.id, session.profile, credential, terminal.cols || 80, terminal.rows || 24);
     void start.then(() => {
       if (sessionStates[session.id] === "connecting") {
         sessionStates[session.id] = "connected";
@@ -947,14 +1024,14 @@ function scheduleTerminalResize(session: TerminalSession, runtime: TerminalRunti
   }, delay);
 }
 
-async function connectProfile(profile: HostProfile, password: string) {
+async function connectProfile(profile: HostProfile, credential: AuthInput) {
   if (!runtimeAvailable.value) {
     formError.value = "SSH 连接需要在 Tauri 桌面应用中运行。";
     return;
   }
   const sessionId = `ssh-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  pendingPasswords.set(sessionId, password);
-  sshPasswords.set(sessionId, password);
+  pendingCredentials.set(sessionId, credential);
+  sshCredentials.set(sessionId, credential);
   sessionStates[sessionId] = "connecting";
   connectionStates[profile.id] = "connecting";
   sessions.value.push({ id: sessionId, kind: "ssh", profile });
@@ -966,24 +1043,23 @@ async function reconnectActiveSession() {
   const session = activeSession.value;
   if (!session || !runtimeAvailable.value || sessionStates[session.id] === "connecting") return;
 
-  let password = "";
+  let credential: AuthInput = { authMethod: "password", password: "", privateKey: "", passphrase: "" };
   if (session.kind === "ssh") {
-    password = sshPasswords.get(session.id) || credentialCache.get(session.profile.id) || "";
-    if (!password) {
-      try {
-        password = await invoke<string | null>("credential_get", { profileId: session.profile.id }) || "";
-      } catch (error) {
-        const runtime = terminalRuntimes.get(session.id);
-        runtime?.terminal.writeln(`\r\n\x1b[31m读取已保存的 SSH 密码失败：${String(error)}\x1b[0m\r\n`);
-        return;
-      }
-    }
-    if (!password) {
-      openProfile(session.profile);
-      formError.value = "此会话没有已保存的密码，请输入密码后重新连接。";
+    try {
+      credential = sshCredentials.get(session.id)
+        || await loadCredential(session.profile)
+        || { authMethod: "password" as AuthMethod, password: "", privateKey: "", passphrase: "" };
+    } catch (error) {
+      const runtime = terminalRuntimes.get(session.id);
+      runtime?.terminal.writeln(`\r\n\x1b[31m读取已保存的 SSH 凭据失败：${String(error)}\x1b[0m\r\n`);
       return;
     }
-    credentialCache.set(session.profile.id, password);
+    const hasCredential = credential.authMethod === "privateKey" ? !!credential.privateKey.trim() : !!credential.password;
+    if (!hasCredential) {
+      openProfile(session.profile);
+      formError.value = "此会话没有已保存的凭据，请输入后重新连接。";
+      return;
+    }
   }
 
   const sessionId = session.id;
@@ -1010,8 +1086,8 @@ async function reconnectActiveSession() {
     if (session.kind === "local") {
       await invoke("local_start", { sessionId, cols, rows });
     } else {
-      sshPasswords.set(sessionId, password);
-      await establishSshSession(sessionId, session.profile, password, cols, rows);
+      sshCredentials.set(sessionId, credential);
+      await establishSshSession(sessionId, session.profile, credential, cols, rows);
     }
     if (!sessions.value.some((item) => item.id === sessionId)) {
       await invoke(stopCommand, { sessionId });
@@ -1030,25 +1106,29 @@ async function reconnectActiveSession() {
     runtime?.terminal.writeln(`\r\n\x1b[31m重新连接失败：${String(error)}\x1b[0m\r\n`);
   }
 }
+function formatSftpError(error: unknown): string {
+  const message = String(error).replace(/^SFTP 任务失败：/, "");
+  // 服务器未开启 SFTP 子系统（如群晖 NAS 默认只开 SSH）时给出明确、友好的提示。
+  if (/SFTP 子系统|subsystem|Unable to request SFTP|未开启 SFTP/i.test(message)) {
+    return "该服务器未提供 SFTP 文件服务（可能未开启 SFTP 子系统）。SSH 终端不受影响，可继续正常使用。";
+  }
+  return message;
+}
+
 async function refreshSftp(path = sftpPath.value) {
   const session = activeSession.value;
-  const password = session ? sshPasswords.get(session.id) : undefined;
-  if (!session || session.kind !== "ssh" || !password) return;
+  if (!session || session.kind !== "ssh" || sessionStates[session.id] !== "connected") return;
   sftpLoading.value = true;
   sftpError.value = "";
   try {
     const result = await invoke<{ path: string; entries: SftpEntry[] }>("sftp_list", {
-      host: session.profile.host,
-      port: session.profile.port,
-      username: session.profile.username,
-      password,
-      trustedFingerprint: session.profile.fingerprint || null,
+      sessionId: session.id,
       path,
     });
     sftpPath.value = result.path;
     sftpEntries.value = result.entries;
   } catch (error) {
-    sftpError.value = String(error);
+    sftpError.value = formatSftpError(error);
   } finally {
     sftpLoading.value = false;
   }
@@ -1082,83 +1162,99 @@ async function uploadSftpFile(event: Event) {
   const session = activeSession.value;
   input.value = "";
   if (!file || !session || session.kind !== "ssh") return;
-  const password = sshPasswords.get(session.id);
-  if (!password) return;
   const existing = sftpEntries.value.find((entry) => entry.name === file.name);
   const overwrite = existing ? window.confirm(`远程目录中已存在“${file.name}”，是否覆盖？`) : false;
   if (existing && !overwrite) return;
-  if (file.size > MAX_SFTP_FILE_SIZE) {
-    sftpError.value = "单个文件最大支持 32 MB。";
-    return;
-  }
   sftpLoading.value = true;
   sftpError.value = "";
+  const path = remoteChildPath(file.name);
   try {
-    const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-    await invoke("sftp_upload", {
-      host: session.profile.host, port: session.profile.port, username: session.profile.username,
-      password, trustedFingerprint: session.profile.fingerprint || null,
-      path: remoteChildPath(file.name), data: bytes, overwrite,
-    });
+    let offset = 0;
+    let create = true;
+    while (offset < file.size || create) {
+      const end = Math.min(offset + SFTP_CHUNK_SIZE, file.size);
+      const bytes = Array.from(new Uint8Array(await file.slice(offset, end).arrayBuffer()));
+      await invoke("sftp_upload_chunk", {
+        sessionId: session.id,
+        path,
+        offset,
+        data: bytes,
+        overwrite,
+        create,
+      });
+      offset = end;
+      create = false;
+      sftpTransfer.value = `上传中 ${Math.floor((offset / Math.max(file.size, 1)) * 100)}%`;
+    }
     await refreshSftp();
   } catch (error) {
-    sftpError.value = String(error);
+    sftpError.value = formatSftpError(error);
   } finally {
     sftpLoading.value = false;
+    sftpTransfer.value = "";
   }
 }
 async function downloadSftpFile(entry: SftpEntry) {
   const session = activeSession.value;
   if (!session || session.kind !== "ssh") return;
-  const password = sshPasswords.get(session.id);
-  if (!password) return;
   sftpError.value = "";
+  sftpLoading.value = true;
   try {
-    const bytes = await invoke<number[]>("sftp_download", {
-      host: session.profile.host, port: session.profile.port, username: session.profile.username,
-      password, trustedFingerprint: session.profile.fingerprint || null, path: entry.path,
-    });
-    const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)]));
+    const chunks: BlobPart[] = [];
+    let offset = 0;
+    while (true) {
+      const bytes = await invoke<number[]>("sftp_download_chunk", {
+        sessionId: session.id,
+        path: entry.path,
+        offset,
+      });
+      if (bytes.length === 0) break;
+      const buffer = new ArrayBuffer(bytes.length);
+      new Uint8Array(buffer).set(bytes);
+      chunks.push(buffer);
+      offset += bytes.length;
+      if (bytes.length < SFTP_CHUNK_SIZE) break;
+      sftpTransfer.value = `下载中 ${formatBytes(offset)}`;
+    }
+    const url = URL.createObjectURL(new Blob(chunks));
     const link = document.createElement("a");
     link.href = url;
     link.download = entry.name;
     link.click();
     URL.revokeObjectURL(url);
   } catch (error) {
-    sftpError.value = String(error);
+    sftpError.value = formatSftpError(error);
+  } finally {
+    sftpLoading.value = false;
+    sftpTransfer.value = "";
   }
 }
 async function createSftpDirectory() {
   const name = window.prompt("新目录名称");
   const session = activeSession.value;
   if (!name?.trim() || !session || session.kind !== "ssh") return;
-  const password = sshPasswords.get(session.id);
-  if (!password) return;
   try {
     await invoke("sftp_mkdir", {
-      host: session.profile.host, port: session.profile.port, username: session.profile.username,
-      password, trustedFingerprint: session.profile.fingerprint || null,
+      sessionId: session.id,
       path: remoteChildPath(name.trim()),
     });
     await refreshSftp();
   } catch (error) {
-    sftpError.value = String(error);
+    sftpError.value = formatSftpError(error);
   }
 }
 async function deleteSftpEntry(entry: SftpEntry) {
   if (!window.confirm(`确定删除“${entry.name}”吗？`)) return;
   const session = activeSession.value;
   if (!session || session.kind !== "ssh") return;
-  const password = sshPasswords.get(session.id);
-  if (!password) return;
   try {
     await invoke("sftp_delete", {
-      host: session.profile.host, port: session.profile.port, username: session.profile.username,
-      password, trustedFingerprint: session.profile.fingerprint || null, path: entry.path,
+      sessionId: session.id,
+      path: entry.path,
     });
     await refreshSftp();
   } catch (error) {
-    sftpError.value = String(error);
+    sftpError.value = formatSftpError(error);
   }
 }
 async function saveAndConnect() {
@@ -1175,35 +1271,46 @@ async function saveAndConnect() {
     formError.value = "端口范围应为 1–65535。";
     return;
   }
-  const profile: HostProfile = {
-    id: editingProfileId.value || `host-${Date.now()}`,
-    name: profileForm.name.trim(), host: profileForm.host.trim(), port: Number(profileForm.port), username: profileForm.username.trim(),
-    fingerprint: currentProfileFingerprint(),
-  };
-  let password = profileForm.password;
-  if (!password) {
+  let credential = currentAuthInput();
+  if (credential.authMethod === "password" && !credential.password && editingProfileId.value) {
     try {
-      password = await invoke<string | null>("credential_get", { profileId: profile.id }) || "";
+      credential.password = await readCredential(editingProfileId.value);
     } catch (error) {
       formError.value = `读取已保存的 SSH 密码失败：${String(error)}`;
       return;
     }
   }
-  if (!password) {
+  if (credential.authMethod === "privateKey" && !credential.privateKey.trim() && editingProfileId.value) {
+    const saved = await loadCredential({ id: editingProfileId.value, authMethod: "privateKey" } as HostProfile);
+    if (saved) credential = { ...saved };
+  }
+  if (credential.authMethod === "password" && !credential.password) {
     formError.value = "请输入 SSH 密码。首次保存后，之后可从会话管理直接连接。";
     return;
   }
+  if (credential.authMethod === "privateKey" && !credential.privateKey.trim()) {
+    formError.value = "请粘贴私钥内容。首次保存后，之后可从会话管理直接连接。";
+    return;
+  }
+  const profile: HostProfile = {
+    id: editingProfileId.value || `host-${Date.now()}`,
+    name: profileForm.name.trim(), host: profileForm.host.trim(), port: Number(profileForm.port), username: profileForm.username.trim(),
+    fingerprint: currentProfileFingerprint(),
+    authMethod: credential.authMethod,
+  };
   try {
-    await invoke("credential_store", { profileId: profile.id, password });
-    credentialCache.set(profile.id, password);
+    await storeCredential(profile, credential);
   } catch (error) {
-    formError.value = `无法将密码保存到系统凭据管理器：${String(error)}`;
+    formError.value = `无法将凭据保存到系统凭据管理器：${String(error instanceof Error ? error.message : String(error))}`;
     return;
   }
   if (editingProfileId.value) profiles.value = profiles.value.map((item) => item.id === profile.id ? profile : item);
   else profiles.value.unshift(profile);
   persistProfiles();
-  await connectProfile(profile, password);
+  profileForm.password = "";
+  profileForm.privateKey = "";
+  profileForm.passphrase = "";
+  await connectProfile(profile, credential);
 }
 async function closeSession(sessionId = activeSessionId.value) {
   if (!sessionId) return;
@@ -1223,8 +1330,8 @@ async function closeSession(sessionId = activeSessionId.value) {
     connectionStates[session.profile.id] = "disconnected";
   }
   if (hostTrustRequest.value?.sessionId === sessionId) cancelHostTrust();
-  pendingPasswords.delete(sessionId);
-  sshPasswords.delete(sessionId);
+  pendingCredentials.delete(sessionId);
+  sshCredentials.delete(sessionId);
   delete sessionStates[sessionId];
   sftpOpen.value = false;
   destroyTerminal(sessionId);
@@ -1442,7 +1549,17 @@ onUnmounted(() => {
           <label class="field-label">连接名称<input v-model="profileForm.name" autofocus autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="例如：生产环境" /></label>
           <div class="form-row"><label class="field-label grow-field">主机地址<input v-model="profileForm.host" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="服务器 IP 或域名" /></label><label class="field-label port-field">端口<input v-model.number="profileForm.port" type="number" min="1" max="65535" /></label></div>
           <label class="field-label">用户名<input v-model="profileForm.username" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="root" /></label>
-          <label class="field-label">密码<input v-model="profileForm.password" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="输入 SSH 密码" /></label>
+          <div class="field-label">认证方式
+            <div class="auth-method-switch">
+              <button type="button" :class="['auth-method-option', { active: profileForm.authMethod === 'password' }]" @click="profileForm.authMethod = 'password'">密码</button>
+              <button type="button" :class="['auth-method-option', { active: profileForm.authMethod === 'privateKey' }]" @click="profileForm.authMethod = 'privateKey'">私钥</button>
+            </div>
+          </div>
+          <label v-if="profileForm.authMethod === 'password'" class="field-label">密码<input v-model="profileForm.password" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="输入 SSH 密码" /></label>
+          <template v-else>
+            <label class="field-label">私钥内容<textarea v-model="profileForm.privateKey" class="private-key-input" rows="5" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="粘贴 -----BEGIN OPENSSH PRIVATE KEY----- 开头的完整私钥" /></label>
+            <label class="field-label">私钥口令（可选）<input v-model="profileForm.passphrase" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="私钥未加密则留空" /></label>
+          </template>
           <p v-if="formError" class="form-error">{{ formError }}</p>
           <p v-if="testError" class="form-error">{{ testError }}</p>
           <p v-if="testStatus" class="test-status">{{ testStatus }}</p>
@@ -1450,7 +1567,7 @@ onUnmounted(() => {
             <span>主机指纹：<code>{{ testFingerprintToTrust }}</code></span>
             <button class="secondary-button" type="button" :disabled="testLoading" @click="testConnection(testFingerprintToTrust)">信任指纹并重试</button>
           </div>
-          <div class="credential-note"><Check :size="14" />密码保存于系统凭据管理器，不写入主机资料。</div>
+          <div class="credential-note"><Check :size="14" />凭据保存于系统凭据管理器，不写入主机资料。</div>
           <div class="modal-actions"><button class="secondary-button" type="button" :disabled="testLoading" @click="testConnection()">{{ testLoading ? "测试中…" : "测试连接" }}</button><button class="secondary-button" type="button" @click="isModalOpen = false">取消</button><button class="primary-button modal-submit" type="submit"><TerminalSquare :size="16" /> 保存并连接</button></div>
         </form>
       </section>
@@ -1555,10 +1672,10 @@ onUnmounted(() => {
             </span>
           </button>
           <div v-if="!sftpLoading && sftpEntries.length === 0 && !sftpError" class="sftp-empty">此目录为空</div>
-          <div v-if="sftpLoading" class="sftp-empty">正在读取远程目录…</div>
+          <div v-if="sftpLoading" class="sftp-empty">{{ sftpTransfer || "正在读取远程目录…" }}</div>
           <p v-if="sftpError" class="sftp-error">{{ sftpError }}</p>
         </div>
-        <footer class="sftp-footer">通过 SSH 加密传输 · 单个文件最大 32 MB</footer>
+        <footer class="sftp-footer">通过 SSH 加密传输 · 分块传输，无文件大小限制</footer>
       </section>
     </div>
   </main>
@@ -1597,6 +1714,8 @@ button { cursor: pointer; }
 .welcome-stage { position:relative; flex:1; min-height:0; display:grid; place-items:center; overflow:hidden; background:radial-gradient(ellipse at 51% 46%,#fbfcf8 0%,#f4f5ef 52%,#eef0e9 100%); }.app-shell.appearance-light .welcome-stage { background:radial-gradient(ellipse at 51% 46%,#fffefa 0%,#f7f4ec 57%,#efece3 100%); }.welcome-stage::before { position:absolute; inset:0; content:""; opacity:.22; background-image:radial-gradient(#869584 .55px,transparent .55px); background-size:17px 17px; mask-image:linear-gradient(90deg,transparent 15%,#000 50%,transparent 85%); }.welcome-content { position:relative; z-index:1; display:flex; flex-direction:column; align-items:center; padding:28px 20px; text-align:center; animation:rise-in .55s ease-out both; } @keyframes rise-in { from { opacity:0; transform:translateY(9px); } to { opacity:1; transform:translateY(0); } }.welcome-art { position:relative; width:132px; height:112px; margin-bottom:14px; display:grid; place-items:center; }.orbit { position:absolute; width:112px; height:66px; border:1px solid #cbd5c8; border-radius:50%; transform:rotate(-28deg); }.orbit-two { width:91px; height:92px; border-color:#d6ddd2; transform:rotate(36deg); }.welcome-terminal { position:relative; width:63px; height:51px; display:flex; align-items:center; padding-left:13px; border:1px solid #647b67; border-radius:8px; color:#dcebdd; background:#405747; box-shadow:0 9px 17px #31463630; font-family:"IBM Plex Mono",monospace; font-size:18px; }.welcome-terminal i { position:absolute; right:13px; bottom:14px; width:7px; height:2px; background:#b5d6af; animation:blink 1.2s steps(2,start) infinite; } @keyframes blink { to { visibility:hidden; } }.art-spark { position:absolute; color:#6c8a69; font-family:"IBM Plex Mono",monospace; font-size:18px; }.spark-one { top:5px; right:18px; }.spark-two { bottom:8px; left:12px; color:#b39d6d; font-size:28px; }.welcome-kicker { display:flex; align-items:center; gap:7px; color:#829183; font-family:"IBM Plex Mono",monospace; font-size:9px; letter-spacing:1.2px; }.welcome-kicker span { width:5px; height:5px; border-radius:50%; background:#88a78a; }.welcome-content h2 { margin:15px 0 8px; color:#303b34; font-size:31px; font-weight:600; line-height:1.2; }.welcome-content h2 em { color:#618068; font-style:normal; }.welcome-content p { margin:0 0 22px; color:#869088; font-size:11px; }.primary-button { min-height:37px; display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:0 14px; border:0; border-radius:6px; color:#f5f8f3; background:#55765d; font-size:11px; font-weight:500; transition:background .15s ease; }.welcome-footnote { gap:9px; margin-top:22px; color:#a0a69d; font-size:9px; }.footnote-line { width:21px; height:1px; background:#d5dad2; }.welcome-corner { position:absolute; right:22px; bottom:17px; color:#a7aea4; font-family:"IBM Plex Mono",monospace; font-size:9px; }.welcome-corner span { color:#748a75; }.main-footer { height:29px; flex:0 0 29px; justify-content:space-between; padding:0 18px; color:#a0a79e; font-family:"IBM Plex Mono",monospace; font-size:9px; }.main-footer>span:first-child { display:flex; align-items:center; gap:7px; }.footer-pulse { width:5px; height:5px; }
 .modal-backdrop { position:fixed; z-index:5; inset:0; display:grid; place-items:center; padding:20px; background:#17201ab0; backdrop-filter:blur(3px); }.connection-modal { width:min(100%,430px); max-height:calc(100vh - 40px); overflow-y:auto; padding:22px; border:1px solid #e6e8e1; border-radius:10px; background:#fbfbf7; box-shadow:0 22px 70px #17201a35; animation:rise-in .2s ease-out both; }.modal-header { position:relative; gap:12px; margin-bottom:21px; }.modal-icon { width:37px; height:37px; display:grid; place-items:center; border-radius:8px; color:#56745c; background:#e9efe6; }.modal-header h2 { margin:3px 0 0; color:#29312d; font-size:17px; font-weight:600; }.modal-close { position:absolute; top:0; right:0; }.connection-form { display:flex; flex-direction:column; gap:13px; }.field-label { display:flex; flex-direction:column; gap:6px; color:#626c64; font-size:10px; font-weight:500; }.field-label input { width:100%; height:37px; padding:0 10px; outline:none; border:1px solid #e1e5dd; border-radius:5px; color:#303832; background:#fff; font-size:11px; }.field-label input:focus { border-color:#78967b; box-shadow:0 0 0 3px #7193761c; }.field-label input::placeholder { color:#b3b9b2; }.form-row { display:flex; gap:10px; }.grow-field { flex:1; }.port-field { width:92px; }.form-error { margin:-4px 0 0; color:#b9574f; font-size:10px; }.credential-note { display:flex; align-items:center; gap:6px; margin-top:1px; color:#758778; font-size:10px; }.credential-note svg { color:#6d9473; }.modal-actions { justify-content:flex-end; gap:8px; margin-top:8px; padding-top:14px; border-top:1px solid #e9ebe5; }.secondary-button { min-height:36px; padding:0 13px; border:1px solid #e0e4dc; border-radius:6px; color:#687168; background:#fff; font-size:11px; }.secondary-button:hover { background:#f2f3ed; }.modal-submit { min-height:36px; }
 .primary-button:disabled { cursor:not-allowed; opacity:.55; }
+.auth-method-switch { display:flex; gap:6px; }.auth-method-option { flex:1; min-height:32px; border:1px solid #e1e5dd; border-radius:5px; color:#626c64; background:#fff; font-size:11px; }.auth-method-option:hover { background:#f2f3ed; }.auth-method-option.active { border-color:#78967b; color:#2f5d38; background:#eef4ec; font-weight:500; }.field-label textarea.private-key-input { width:100%; padding:9px 10px; outline:none; border:1px solid #e1e5dd; border-radius:5px; color:#303832; background:#fff; font-family:"IBM Plex Mono",monospace; font-size:10px; line-height:1.5; resize:vertical; }.field-label textarea.private-key-input:focus { border-color:#78967b; box-shadow:0 0 0 3px #7193761c; }.field-label textarea.private-key-input::placeholder { color:#b3b9b2; }
+.app-shell .auth-method-option { border-color:#3a4047; color:#b9c0c8; background:#1b1f24; }.app-shell .auth-method-option:hover { background:#232830; }.app-shell .auth-method-option.active { border-color:#8995a2; color:#d6e2d0; background:#232b27; }.app-shell .field-label textarea.private-key-input { border-color:#3a4047; color:#e3e6e9; background:#171a1e; }.app-shell .field-label textarea.private-key-input:focus { border-color:#8995a2; box-shadow:0 0 0 3px #aeb8c21a; }
 .welcome-content .runtime-message { max-width:320px; color:#9b6b4a; }
 .saved-session-edit { width:29px; height:29px; display:grid; place-items:center; border:0; border-radius:4px; color:var(--text-faint); background:transparent; }.saved-session-edit:hover { color:var(--accent); background:var(--surface-muted); }.about-modal { position:relative; width:min(100%,360px); padding:28px 26px 22px; border:1px solid var(--border); border-radius:10px; color:var(--text); text-align:center; background:var(--sidebar); box-shadow:0 22px 70px #17201a35; animation:rise-in .2s ease-out both; }.about-modal .modal-close { top:14px; right:14px; }.about-mark { width:50px; height:50px; display:grid; place-items:center; margin:3px auto 13px; border-radius:12px; color:#ecf3e9; background:#384c3e; }.about-modal h2 { margin:0; font-size:19px; font-weight:650; }.about-version { margin:6px 0 17px; color:var(--text-faint); font-family:"IBM Plex Mono",monospace; font-size:10px; }.about-description { margin:0 auto; max-width:260px; color:var(--text-soft); font-size:11px; line-height:1.7; }.about-credits { margin:18px 0; padding-top:14px; border-top:1px solid var(--border); color:var(--text-faint); font-family:"IBM Plex Mono",monospace; font-size:9px; }.about-close { min-width:76px; }
 .app-shell .terminal-stage.terminal-homebrew { border-color:#183018; box-shadow:0 0 24px #00ff0010; }.terminal-homebrew .terminal-statusbar { color:#00b800; background:#071007; }
